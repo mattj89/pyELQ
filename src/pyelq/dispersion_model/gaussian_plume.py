@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Callable, Union
 
 import numpy as np
+import jax.numpy as jnp
 
 import pyelq.support_functions.spatio_temporal_interpolation as sti
 from pyelq.coordinate_system import ENU, LLA
@@ -624,3 +625,79 @@ def _create_enu_sensor_array(
     ).to_array()
 
     return enu_sensor_array
+
+
+def compute_coupling_array_jax(
+    sensor_x: np.ndarray,
+    sensor_y: np.ndarray,
+    sensor_z: np.ndarray,
+    source_z: np.ndarray,
+    wind_speed: np.ndarray,
+    theta: np.ndarray,
+    wind_turbulence_horizontal: np.ndarray,
+    wind_turbulence_vertical: np.ndarray,
+    gas_density: Union[float, np.ndarray],
+    source_half_width: float = 1.0,
+    minimum_contribution: float = 1e-16,
+) -> np.ndarray:
+    """Compute the Gaussian plume coupling, using jax.numpy functionality (instead of the standard numpy functionality
+    used in the first version).
+
+    TODO (13/06/24): should be able to show that this version produces identical results to the original. Should
+    implement this as a unit test.
+
+    Most low level function to calculate the Gaussian plume coupling. Assuming input shapes are consistent but no
+    checking is done on this.
+
+    Setting sigma_vert to 1e-16 when it is identically zero (distance_x == 0) so we don't get a divide by 0 error
+    all the time.
+
+    Args:
+        sensor_x (jnp.ndarray): sensor x location relative to source [m].
+        sensor_y (jnp.ndarray): sensor y location relative to source [m].
+        sensor_z (jnp.ndarray): sensor z location relative to ground height [m].
+        source_z (jnp.ndarray): source z location relative to ground height [m].
+        wind_speed (jnp.ndarray): wind speed at source locations in [m/s].
+        theta (jnp.ndarray): Mathematical wind direction at source locations [radians]:
+            calculated as np.arctan2(v_component_wind, u_component_wind).
+        wind_turbulence_horizontal (jnp.ndarray): Horizontal wind turbulence [deg].
+        wind_turbulence_vertical (jnp.ndarray): Vertical wind turbulence [deg].
+        gas_density (Union[float, jnp.ndarray]): Gas density to use in coupling calculation [kg/m^3].
+        source_half_width (float, optional): Source radius [m]. Defaults to 1.
+        minimum_contribution (float, optional): Minimum coupling required, anything below this value is set to 0.
+            Defaults to 1e-16.
+
+    Returns:
+        plume_coupling (jnp.ndarray): Gaussian plume coupling in (1e6)*[hr/kg]: gives concentrations
+            in [ppm] when multiplied by sources in [kg/hr].
+
+    """
+    cos_theta = jnp.cos(theta)
+    sin_theta = jnp.sin(theta)
+
+    distance_x = cos_theta * sensor_x + sin_theta * sensor_y
+    # if jnp.all(distance_x < 0):
+    #     return jnp.zeros_like(distance_x)
+
+    distance_y = -sin_theta * sensor_x + cos_theta * sensor_y
+
+    sigma_hor = jnp.tan(wind_turbulence_horizontal * (jnp.pi / 180)) * jnp.abs(distance_x) + source_half_width
+    sigma_vert = jnp.tan(wind_turbulence_vertical * (jnp.pi / 180)) * jnp.abs(distance_x)
+
+    sigma_vert = jnp.where(sigma_vert == 0, 1e-16, sigma_vert)
+
+    plume_coupling = (
+        (1 / (2 * jnp.pi * wind_speed * sigma_hor * sigma_vert))
+        * jnp.exp(-0.5 * (distance_y / sigma_hor) ** 2)
+        * (
+            jnp.exp(-0.5 * (((sensor_z + source_z) / sigma_vert) ** 2))
+            + jnp.exp(-0.5 * (((sensor_z - source_z) / sigma_vert) ** 2))
+        )
+    )
+
+    plume_coupling = jnp.divide(plume_coupling * 1e6, (gas_density * 3600))
+    plume_coupling = jnp.where(
+        jnp.logical_or(distance_x < 0, plume_coupling < minimum_contribution), 0, plume_coupling
+    )
+
+    return plume_coupling

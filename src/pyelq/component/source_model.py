@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Tuple, Union
 
 import numpy as np
+import jax.numpy as jnp
+
 from openmcmc import parameter
 from openmcmc.distribution.distribution import Categorical, Gamma, Poisson, Uniform
 from openmcmc.distribution.location_scale import Normal as mcmcNormal
@@ -29,13 +31,15 @@ from openmcmc.model import Model
 from openmcmc.sampler.metropolis_hastings import RandomWalkLoop
 from openmcmc.sampler.reversible_jump import ReversibleJump
 from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal
+from openmcmc.parameter_jax import Parameter_jax, LinearCombinationDependent_jax
 
 from pyelq.component.component import Component
 from pyelq.coordinate_system import ENU
-from pyelq.dispersion_model.gaussian_plume import GaussianPlume
+from pyelq.dispersion_model.gaussian_plume import GaussianPlume, compute_coupling_array_jax
 from pyelq.gas_species import GasSpecies
 from pyelq.meteorology import Meteorology
-from pyelq.sensor.sensor import SensorGroup
+from pyelq.sensor.sensor import SensorGroup, Sensor
+from pyelq.sensor.beam import Beam
 from pyelq.source_map import SourceMap
 
 if TYPE_CHECKING:
@@ -860,3 +864,105 @@ class NormalSlabAndSpike(SourceModel, SlabAndSpike, NormalResponse):
 
     initial_precision: np.ndarray = field(default_factory=lambda: np.array([1 / (10**2), 1 / (0.01**2)], ndmin=2).T)
     emission_rate_mean: np.ndarray = field(default_factory=lambda: np.array([0, 0], ndmin=2).T)
+
+
+@dataclass
+class SourceModelParameter(LinearCombinationDependent_jax):
+    """Parameter class for the source model, which allows for updating of the coupling matrix as part of the
+    log-likelihood calls.
+
+    Initialization of the parameter class extracts the sensor locations and meteorology information from the objects
+    passed in, converts them to jax.numpy arrays and stores them locally on the class. 
+
+    Attributes:
+        sensor_locations (dict): 
+    
+    """
+    sensor_locations: dict
+    wind_speed: jnp.ndarray
+    theta: jnp.ndarray
+    wind_turbulence_horizontal: jnp.ndarray
+    wind_turbulence_vertical: jnp.ndarray
+    gas_density: jnp.ndarray
+
+    def __init__(self, form, sensor_object, meteorology_object, gas_species, source_map):
+        """Function which takes the pyELQ data sensor and meteorology objects, converts the relevant attributes to
+        jax.numpy objects, and attaches them to the class ready for repeated use in the sampler.
+
+
+
+        """
+        self.form = form
+        self.extract_sensor_information(sensor_object, source_map)
+        self.extract_meteorology_information(meteorology_object)
+        self.gas_density = jnp.array(gas_species.gas_density())
+
+    def extract_sensor_information(self, sensor_object, source_map):
+        """Sub-function for extracting and storing sensor location information."""
+        source_map_enu = source_map.location
+        # TODO (14/06/24): May need to handle the co-ordinate conversion- assuming ENU for now.
+        self.sensor_locations = {}
+        for key, sensor in sensor_object.items():
+            if isinstance(sensor, Beam):
+                enu_sensor_array = sensor.make_beam_knots(
+                    ref_latitude=source_map_enu.ref_latitude,
+                    ref_longitude=source_map_enu.ref_longitude,
+                    ref_altitude=source_map_enu.ref_altitude,
+                )
+                enu_sensor_array = np.swapaxes(np.atleast_3d(enu_sensor_array), 0, 2)
+            else:
+                enu_sensor_array = sensor.location.to_enu(
+                    ref_latitude=source_map_enu.ref_latitude,
+                    ref_longitude=source_map_enu.ref_longitude,
+                    ref_altitude=source_map_enu.ref_altitude,
+                ).to_array()
+                enu_sensor_array = np.atleast_3d(enu_sensor_array)
+            self.sensor_locations[key] = jnp.array(enu_sensor_array)
+
+    def extract_meteorology_information(self, meteorology_object):
+        """Sub-function for extracting and storing meteorological information."""
+        self.wind_speed = {}
+        self.theta = {}
+        self.wind_turbulence_horizontal = {}
+        self.wind_turbulence_vertical = {}
+        for key, meteo in meteorology_object.items():
+            self.wind_speed[key] = jnp.array(meteo.wind_speed).reshape((meteo.wind_speed.shape[0], 1, 1))
+            theta = np.arctan2(meteo.v_component, meteo.u_component)
+            self.theta[key] = jnp.array(theta).reshape((meteo.wind_direction.shape[0], 1, 1))
+            self.wind_turbulence_horizontal[key] = \
+                jnp.array(meteo.wind_turbulence_horizontal).reshape((meteo.wind_turbulence_horizontal.shape[0], 1, 1))
+            self.wind_turbulence_vertical[key] = \
+                jnp.array(meteo.wind_turbulence_vertical).reshape((meteo.wind_turbulence_vertical.shape[0], 1, 1))
+
+    def update_prefactors(self, state: dict, **kwargs) -> dict:
+        """Update the coupling matrix based on the information in the state.
+
+        Accounts for the situation where e.g. the source location or the wind sigma parameters change during the MCMC.
+
+        TODO (14/06/24): There might be a better way to implement this (instead of a loop): but need to account for the
+        fact that the point and beam sensor cases get handled differently (need a 3rd dimension for the beam knots).
+
+        TODO (14/06/24): For the reversible jump case, might need to add an update of the number of sources and
+        allocation vector.
+
+        Args:
+            state (dict): dictionary containing current state information.
+
+        """
+        key_list = list(self.sensor_locations.keys())
+        state["A"] = jnp.empty(shape=(0, state["z"].shape[1]))
+        for key in key_list:
+            relative_x = self.sensor_locations[key][:, [0], :] - jnp.atleast_3d(state["z"][[0], :])
+            relative_y = self.sensor_locations[key][:, [1], :] - jnp.atleast_3d(state["z"][[1], :])
+            sensor_z = self.sensor_locations[key][:, [2], :]
+            source_z = jnp.atleast_3d(state["z"][[2], :])
+            coupling_array = compute_coupling_array_jax(
+                sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
+                wind_speed=self.wind_speed[key], theta=self.theta[key],
+                wind_turbulence_horizontal=self.wind_turbulence_horizontal[key],
+                wind_turbulence_vertical=self.wind_turbulence_vertical[key],
+                gas_density=self.gas_density
+            )
+            coupling_array = jnp.mean(coupling_array, axis=2) 
+            state["A"] = jnp.concatenate((state["A"], coupling_array), axis=0)
+        return state

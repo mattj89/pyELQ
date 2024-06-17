@@ -44,6 +44,10 @@ pytest-cov = ">=4.1.0"
 mkdocs-material = ">=9.5.7"
 mkdocstrings-python = ">=1.8.0"
 
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.4"
+
 [tool.pytest.ini_options]
 addopts = "--cov=pyelq --cov-fail-under=90 --ignore-glob=*plot*"
 testpaths = ["tests"]
