@@ -68,7 +68,7 @@ source during the selected monitoring period, then it will be impossible to dete
 this particular source. 
 Also, there are limitations to the forward dispersion model which is used in the analysis. 
 For example, the performance of the Gaussian plume dispersion model will degrade at lower wind speeds. 
-Therefore, careful interpretation of the data is always required. 
+Therefore, careful interpretation of the data is always required.
 
 ***
 # Installing pyELQ as a package
