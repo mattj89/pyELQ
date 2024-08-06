@@ -300,8 +300,8 @@ sampler[0].step = np.array([[0.25]])
 
 # perturb the starting point
 perturbed_state = deepcopy(initial_state)
-perturbed_state["z"] = perturbed_state["z"] + jnp.array([[1, 1, 0],
-                                                         [1, 1, 0]]).T
+perturbed_state["z"] = perturbed_state["z"] + jnp.array([[5, 5, 0],
+                                                         [5, 5, 0]]).T
 
 # set up the MCMC object
 mcmc = MCMC(perturbed_state, sampler, model=mdl, n_burn=2000, n_iter=5000)
