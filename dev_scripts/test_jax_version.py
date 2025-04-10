@@ -302,6 +302,9 @@ sampler[0].step = np.array([[0.25]])
 perturbed_state = deepcopy(initial_state)
 perturbed_state["z"] = perturbed_state["z"] + jnp.array([[1, 1, 0],
                                                          [1, 1, 0]]).T
+# NOTE (06/08/24): If I start this np.sqrt(2) metres away from the source, then it works fine (high acceptance rate).
+# If I start 2 metres away without changing the step size, then it gets 0% acceptance.
+# The Hessian is position-dependent, so 
 
 # set up the MCMC object
 mcmc = MCMC(perturbed_state, sampler, model=mdl, n_burn=2000, n_iter=5000)
