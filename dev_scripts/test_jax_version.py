@@ -27,12 +27,13 @@ from pyelq.source_map import SourceMap
 from pyelq.component.source_model import SourceModelParameter
 
 from openmcmc import parameter_jax
-from openmcmc.distribution.distribution_jax import Normal_jax
+from openmcmc.distribution.distribution_jax import Normal_jax, Uniform_jax
 from openmcmc.distribution import location_scale
 from openmcmc import parameter
 from openmcmc.model import Model
 from openmcmc.sampler.sampler import NormalNormal
 from openmcmc.sampler.metropolis_hastings import ManifoldMALA
+from openmcmc.sampler.reversible_jump import ReversibleJump
 from openmcmc.mcmc import MCMC
 
 """
@@ -247,15 +248,25 @@ likelihood_y.param_list = ["s", "z"]
 prior_s = Normal_jax(
     response="s", grad_list=["s"], 
     mean=parameter_jax.Identity_jax(form="mu_s"), 
-    precision=parameter_jax.Identity_jax(form="P_s")
+    precision=parameter_jax.ScaledMatrix_jax(scalar="lam_s", matrix="P_s")
 )
 prior_s.param_list = ["s"]
+
+# set up the prior for the location
+prior_z = Uniform_jax(
+    response="z",
+    grad_list=["z"],
+    domain_response_lower=site_limits[:, [0]],
+    domain_response_upper=site_limits[:, [1]],
+)
+prior_z.param_list = ["z"]
 
 # set up the initial state
 initial_state = {"y": jnp.atleast_2d(jnp.array(elq_model.sensor_object.concentration)).T}
 # add in the source locations and emission rates
 initial_state["z"] = jnp.array(source_map.location.to_array().T)
 initial_state["s"] = jnp.array(true_emission_rates)
+initial_state["n_src"] = initial_state["z"].shape[1]
 
 # add in the initial coupling matrix
 initial_state = data_mean.update_prefactors(initial_state)
@@ -285,18 +296,56 @@ Set up the MCMC sampler using the above specification.
 
 # set up the remainder of the variables in the state
 initial_state["mu_s"] = 0.0 * jnp.ones(shape=(2, 1))
-initial_state["P_s"] = (1.0 / jnp.power(100.0, 2)) * jnp.eye(2)
+initial_state["lam_s"] = jnp.float64(1.0 / jnp.power(100.0, 2))
+initial_state["P_s"] = jnp.eye(2)
 initial_state["Q"] = (1.0 / jnp.power(0.1, 2)) * jnp.eye(initial_state["y"].size)
 
 # put the model together.
 likelihood_y.precompute_log_det_precision(initial_state)
-mdl = Model([likelihood_y, prior_s])
+mdl = Model([likelihood_y, prior_s, prior_z])
+
+# stuff to make the reversible jump work
+n_sources_max = 10
+matching_params = {"variable": "s", "matrix": "A", "scale": 1.0, "limits": [0.0, 1e6]}
 
 # set up the samplers
 sampler = [ManifoldMALA("z", mdl),
            NormalNormal("s", mdl)]
 sampler[0].max_variable_size = (3, 2)
 sampler[0].step = np.array([[0.25]])
+
+# make proto birth and death functions for the RJ case to see what happens.
+def birth_function_jax(current_state: dict, prop_state: dict):
+    """Birth function for the JAX case."""
+    prop_state = data_mean.update_prefactors(prop_state)
+    prop_state["s"] = jnp.concatenate((prop_state["s"], jnp.zeros(shape=(1, 1))), axis=0)
+    prop_state["P_s"] = jnp.eye(prop_state["s"].shape[0])
+    prop_state["mu_s"] = jnp.zeros(shape=prop_state["s"].shape)
+    return prop_state, 0.0, 0.0
+
+def death_function_jax(current_state: dict, prop_state: dict, deletion_index: int):
+    """Death function for the JAX case."""
+    prop_state = data_mean.update_prefactors(prop_state)
+    prop_state["s"] = jnp.delete(
+        prop_state["s"], deletion_index, axis=0, assume_unique_indices=True
+    )
+    prop_state["P_s"] = jnp.eye(prop_state["s"].shape[0])
+    prop_state["mu_s"] = jnp.zeros(shape=prop_state["s"].shape)
+    return prop_state, 0.0, 0.0
+
+# add in the reversible jump sampler for n_src (test to see if/why it breaks)
+sampler.append(
+    ReversibleJump(
+        "n_src",
+        mdl,
+        step=np.array([1.0], ndmin=2),
+        associated_params="z",
+        n_max=n_sources_max,
+        state_birth_function=birth_function_jax,
+        state_death_function=death_function_jax,
+        matching_params=matching_params,
+    )
+)
 
 # perturb the starting point
 perturbed_state = deepcopy(initial_state)
