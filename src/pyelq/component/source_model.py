@@ -964,5 +964,6 @@ class SourceModelParameter(LinearCombinationDependent_jax):
                 gas_density=self.gas_density
             )
             coupling_array = jnp.mean(coupling_array, axis=2) 
+            coupling_array = coupling_array * state["mask"].T
             state["A"] = jnp.concatenate((state["A"], coupling_array), axis=0)
         return state
