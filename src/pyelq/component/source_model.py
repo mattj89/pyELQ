@@ -872,11 +872,11 @@ class SourceModelParameter(LinearCombinationDependent_jax):
     log-likelihood calls.
 
     Initialization of the parameter class extracts the sensor locations and meteorology information from the objects
-    passed in, converts them to jax.numpy arrays and stores them locally on the class. 
+    passed in, converts them to jax.numpy arrays and stores them locally on the class.
 
     Attributes:
-        sensor_locations (dict): 
-    
+        sensor_locations (dict):
+
     """
     sensor_locations: dict
     wind_speed: jnp.ndarray
@@ -901,7 +901,9 @@ class SourceModelParameter(LinearCombinationDependent_jax):
         """Sub-function for extracting and storing sensor location information."""
         source_map_enu = source_map.location
         # TODO (14/06/24): May need to handle the co-ordinate conversion- assuming ENU for now.
-        self.sensor_locations = {}
+        self.sensor_locations_x = {}
+        self.sensor_locations_y = {}
+        self.sensor_locations_z = {}
         for key, sensor in sensor_object.items():
             if isinstance(sensor, Beam):
                 enu_sensor_array = sensor.make_beam_knots(
@@ -917,7 +919,9 @@ class SourceModelParameter(LinearCombinationDependent_jax):
                     ref_altitude=source_map_enu.ref_altitude,
                 ).to_array()
                 enu_sensor_array = np.atleast_3d(enu_sensor_array)
-            self.sensor_locations[key] = jnp.array(enu_sensor_array)
+            self.sensor_locations_x[key] = jnp.array(enu_sensor_array[:, [0], :])
+            self.sensor_locations_y[key] = jnp.array(enu_sensor_array[:, [1], :])
+            self.sensor_locations_z[key] = jnp.array(enu_sensor_array[:, [2], :])
 
     def extract_meteorology_information(self, meteorology_object):
         """Sub-function for extracting and storing meteorological information."""
@@ -949,21 +953,23 @@ class SourceModelParameter(LinearCombinationDependent_jax):
             state (dict): dictionary containing current state information.
 
         """
-        key_list = list(self.sensor_locations.keys())
+        key_list = list(self.sensor_locations_x.keys())
         state["A"] = jnp.empty(shape=(0, state["z"].shape[1]))
+        source_location_x = jnp.atleast_3d(state["z"][[0], :])
+        source_location_y = jnp.atleast_3d(state["z"][[1], :])
+        source_location_z = jnp.atleast_3d(state["z"][[2], :])
         for key in key_list:
-            relative_x = self.sensor_locations[key][:, [0], :] - jnp.atleast_3d(state["z"][[0], :])
-            relative_y = self.sensor_locations[key][:, [1], :] - jnp.atleast_3d(state["z"][[1], :])
-            sensor_z = self.sensor_locations[key][:, [2], :]
-            source_z = jnp.atleast_3d(state["z"][[2], :])
+            relative_x = self.sensor_locations_x[key] - source_location_x
+            relative_y = self.sensor_locations_y[key] -source_location_y
+            sensor_z = self.sensor_locations_z[key]
             coupling_array = compute_coupling_array_jax(
-                sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
+                sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_location_z,
                 wind_speed=self.wind_speed[key], theta=self.theta[key],
                 wind_turbulence_horizontal=self.wind_turbulence_horizontal[key],
                 wind_turbulence_vertical=self.wind_turbulence_vertical[key],
                 gas_density=self.gas_density
             )
-            coupling_array = jnp.mean(coupling_array, axis=2) 
+            coupling_array = jnp.mean(coupling_array, axis=2)
             coupling_array = coupling_array * state["mask"].T
             state["A"] = jnp.concatenate((state["A"], coupling_array), axis=0)
         return state
