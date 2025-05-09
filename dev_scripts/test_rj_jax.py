@@ -385,7 +385,7 @@ perturbed_state = deepcopy(initial_state)
 # The Hessian is position-dependent, so
 
 # set up the MCMC object
-mcmc = MCMC(perturbed_state, sampler, model=mdl, n_burn=50, n_iter=200)
+mcmc = MCMC(perturbed_state, sampler, model=mdl, n_burn=50, n_iter=950)
 mcmc.run_mcmc()
 
 # plot the results
