@@ -676,9 +676,6 @@ def compute_coupling_array_jax(
     sin_theta = jnp.sin(theta)
 
     distance_x = cos_theta * sensor_x + sin_theta * sensor_y
-    # if jnp.all(distance_x < 0):
-    #     return jnp.zeros_like(distance_x)
-
     distance_y = -sin_theta * sensor_x + cos_theta * sensor_y
 
     sigma_hor = jnp.tan(wind_turbulence_horizontal * (jnp.pi / 180)) * jnp.abs(distance_x) + source_half_width

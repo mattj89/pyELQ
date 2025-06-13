@@ -31,7 +31,7 @@ from openmcmc.model import Model
 from openmcmc.sampler.metropolis_hastings import RandomWalkLoop
 from openmcmc.sampler.reversible_jump import ReversibleJump
 from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal
-from openmcmc.parameter_jax import Parameter_jax, LinearCombinationDependent_jax
+from openmcmc.parameter_jax import LinearCombination_jax
 
 from pyelq.component.component import Component
 from pyelq.coordinate_system import ENU
@@ -867,16 +867,16 @@ class NormalSlabAndSpike(SourceModel, SlabAndSpike, NormalResponse):
 
 
 @dataclass
-class SourceModelParameter(LinearCombinationDependent_jax):
+class SourceModelParameter(LinearCombination_jax):
     """Parameter class for the source model, which allows for updating of the coupling matrix as part of the
     log-likelihood calls.
 
     Initialization of the parameter class extracts the sensor locations and meteorology information from the objects
-    passed in, converts them to jax.numpy arrays and stores them locally on the class. 
+    passed in, converts them to jax.numpy arrays and stores them locally on the class.
 
     Attributes:
-        sensor_locations (dict): 
-    
+        sensor_locations (dict):
+
     """
     sensor_locations: dict
     wind_speed: jnp.ndarray
@@ -884,8 +884,9 @@ class SourceModelParameter(LinearCombinationDependent_jax):
     wind_turbulence_horizontal: jnp.ndarray
     wind_turbulence_vertical: jnp.ndarray
     gas_density: jnp.ndarray
+    n_sources_max: int
 
-    def __init__(self, form, sensor_object, meteorology_object, gas_species, source_map):
+    def __init__(self, form, sensor_object, meteorology_object, gas_species, source_map, n_sources_max):
         """Function which takes the pyELQ data sensor and meteorology objects, converts the relevant attributes to
         jax.numpy objects, and attaches them to the class ready for repeated use in the sampler.
 
@@ -896,6 +897,7 @@ class SourceModelParameter(LinearCombinationDependent_jax):
         self.extract_sensor_information(sensor_object, source_map)
         self.extract_meteorology_information(meteorology_object)
         self.gas_density = jnp.array(gas_species.gas_density())
+        self.n_sources_max = n_sources_max
 
     def extract_sensor_information(self, sensor_object, source_map):
         """Sub-function for extracting and storing sensor location information."""
@@ -934,7 +936,7 @@ class SourceModelParameter(LinearCombinationDependent_jax):
             self.wind_turbulence_vertical[key] = \
                 jnp.array(meteo.wind_turbulence_vertical).reshape((meteo.wind_turbulence_vertical.shape[0], 1, 1))
 
-    def update_prefactors(self, state: dict, **kwargs) -> dict:
+    def update_prefactors(self, state: dict, update_index: list = None) -> dict:
         """Update the coupling matrix based on the information in the state.
 
         Accounts for the situation where e.g. the source location or the wind sigma parameters change during the MCMC.
@@ -949,20 +951,25 @@ class SourceModelParameter(LinearCombinationDependent_jax):
             state (dict): dictionary containing current state information.
 
         """
-        key_list = list(self.sensor_locations.keys())
-        state["A"] = jnp.empty(shape=(0, state["z"].shape[1]))
-        for key in key_list:
-            relative_x = self.sensor_locations[key][:, [0], :] - jnp.atleast_3d(state["z"][[0], :])
-            relative_y = self.sensor_locations[key][:, [1], :] - jnp.atleast_3d(state["z"][[1], :])
-            sensor_z = self.sensor_locations[key][:, [2], :]
-            source_z = jnp.atleast_3d(state["z"][[2], :])
-            coupling_array = compute_coupling_array_jax(
-                sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
-                wind_speed=self.wind_speed[key], theta=self.theta[key],
-                wind_turbulence_horizontal=self.wind_turbulence_horizontal[key],
-                wind_turbulence_vertical=self.wind_turbulence_vertical[key],
-                gas_density=self.gas_density
-            )
-            coupling_array = jnp.mean(coupling_array, axis=2) 
-            state["A"] = jnp.concatenate((state["A"], coupling_array), axis=0)
+        if update_index is None:
+            update_index = list(range(self.n_sources_max))
+        else:
+            update_index = [update_index]
+        sensor_key_list = list(self.sensor_locations.keys())
+        for idx in update_index:
+            source_key = "z" + str(idx)
+            coupling_key = "A" + str(idx)
+            for sensor_key in sensor_key_list:
+                relative_x = self.sensor_locations[sensor_key][:, [0], :] - jnp.atleast_3d(state[source_key][[0], :])
+                relative_y = self.sensor_locations[sensor_key][:, [1], :] - jnp.atleast_3d(state[source_key][[1], :])
+                sensor_z = self.sensor_locations[sensor_key][:, [2], :]
+                source_z = jnp.atleast_3d(state[source_key][[2], :])
+                coupling_array = compute_coupling_array_jax(
+                    sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
+                    wind_speed=self.wind_speed[sensor_key], theta=self.theta[sensor_key],
+                    wind_turbulence_horizontal=self.wind_turbulence_horizontal[sensor_key],
+                    wind_turbulence_vertical=self.wind_turbulence_vertical[sensor_key],
+                    gas_density=self.gas_density
+                )
+                state[coupling_key] = jnp.mean(coupling_array, axis=2)
         return state
