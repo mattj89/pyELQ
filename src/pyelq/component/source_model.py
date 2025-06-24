@@ -25,12 +25,13 @@ import numpy as np
 import jax.numpy as jnp
 
 from openmcmc import parameter
+from openmcmc import gmrf
 from openmcmc.distribution.distribution import Categorical, Gamma, Poisson, Uniform
 from openmcmc.distribution.location_scale import Normal as mcmcNormal
 from openmcmc.model import Model
-from openmcmc.sampler.metropolis_hastings import RandomWalkLoop
+from openmcmc.sampler.metropolis_hastings import RandomWalkLoop, ManifoldMALA
 from openmcmc.sampler.reversible_jump import ReversibleJump
-from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal
+from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal, MCMCSampler
 from openmcmc.parameter_jax import LinearCombination_jax
 
 from pyelq.component.component import Component
@@ -899,6 +900,25 @@ class SourceModelParameter(LinearCombination_jax):
         self.gas_density = jnp.array(gas_species.gas_density())
         self.n_sources_max = n_sources_max
 
+    def predictor_conditional(self, state, term_to_exclude = None):
+        """Overloaded version, to take account of the fact that the terms are being screened in/out by the RJ
+        indicator.
+        """
+        if term_to_exclude is None:
+            term_to_exclude = []
+
+        if isinstance(term_to_exclude, str):
+            term_to_exclude = [term_to_exclude]
+
+        sum_terms = 0
+        ct = 0
+        for prm, prefactor in self.form.items():
+            if prm not in term_to_exclude:
+                sum_terms += state["q"][ct] * (state[prefactor] @ state[prm])
+            ct += 1
+        # TODO (17/06/25): robustify this counting mechanism.
+        return sum_terms
+
     def extract_sensor_information(self, sensor_object, source_map):
         """Sub-function for extracting and storing sensor location information."""
         source_map_enu = source_map.location
@@ -973,3 +993,152 @@ class SourceModelParameter(LinearCombination_jax):
                 )
                 state[coupling_key] = jnp.mean(coupling_array, axis=2)
         return state
+
+
+@dataclass
+class ScreenedManifoldMALA(ManifoldMALA):
+    """Version of ManifoldMALA sampler which screens on the RJ on/off variable.
+
+    If state["qi"] == 1 for i = 1,2,...,n, then a sample is generated for source i using the usual functionality.
+    If state["qi"] == 0, then the source i is not sampled, and the coupling matrix is not updated for that source.
+    """
+    parameter_index: int = None
+
+    def sample(self, current_state: dict) -> dict:
+        """Overloaded version of the sample function which screens on the RJ on/off variable.
+
+        Args:
+            current_state (dict): The current state of the MCMC sampler.
+
+        Returns:
+            dict: The updated state after sampling. This is unchanged if state["qi"] == 0.
+
+        """
+        num_source = int(self.param[1:])
+        if current_state["q"][num_source] == 1:
+            return super().sample(current_state)
+        return current_state
+
+    def proposal(self, current_state: dict) -> Tuple[dict, np.ndarray, np.ndarray]:
+        """Overloaded proposal."""
+        prop_state = deepcopy(current_state)
+
+        mu_cr, chol_cr = self._proposal_params(current_state)
+        prop_state[self.param] = gmrf.sample_normal(mu_cr, L=chol_cr)
+        # prop_state = self.model["y"].mean.update_prefactors(prop_state, update_index=self.parameter_index)
+        _, prop_state = self.model["y"].log_p(prop_state, update_index=self.parameter_index)
+        # TODO (17/06/25): don't need full density evaluation here, could save some computation by separately compiling
+        # the coupling matrix. Check.
+        logp_pr_g_cr = self._log_proposal_density(prop_state, mu_cr, chol_cr)
+
+        mu_pr, chol_pr = self._proposal_params(prop_state)
+        logp_cr_g_pr = self._log_proposal_density(current_state, mu_pr, chol_pr)
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+
+@dataclass
+class SourceReversibleJump(ReversibleJump):
+    """Overloaded version of the ReversibleJump sampler, which handles the atomized source set up
+
+    TODO (17/06/25): The reversible jump acceptance now involves
+
+    """
+    indicator_var: str = "q"
+    source_variables: dict = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.source_variables = {"s" + str(i): "z" + str(i) for i in range(self.n_max)}
+        self.other_variables = list(
+            set(self.model.keys()) - set(self.source_variables.keys()) - set(self.source_variables.values())
+        )
+
+    def birth_proposal(self, current_state):
+        """Overloaded."""
+
+        prop_state = deepcopy(current_state)
+        prop_state[self.param] += 1
+        zero_loc = jnp.argwhere(prop_state[self.indicator_var].flatten() == 0)
+        birth_index = int(zero_loc[0, 0])
+        prop_state[self.indicator_var] = prop_state[self.indicator_var].at[birth_index].set(1)
+        # prop_state[self.indicator_var][birth_index] = 1
+        birth_location = "z" + str(birth_index)
+        birth_rate = "s" + str(birth_index)
+
+        # TODO (13/06/25): next section could be done with "associated parameter" or something.
+        prop_state[birth_location] = self.model[birth_location].rvs(state=prop_state, n=1)
+        prop_state[birth_rate] = self.model[birth_rate].rvs(state=prop_state, n=1)
+        log_location_density, _ = self.model[birth_location].log_p(prop_state, by_observation=True)
+        log_rate_density, _ = self.model[birth_rate].log_p(prop_state)
+        log_prop_density = log_location_density + log_rate_density
+
+        # update coupling matrix element
+        # prop_state = self.model["y"].mean.update_prefactors(prop_state, update_index=birth_index)
+        _, prop_state = self.model["y"].log_p(prop_state, update_index=birth_index)
+
+        p_birth, p_death = self.get_move_probabilities(current_state, True)
+        logp_pr_g_cr = np.log(p_birth) + log_prop_density[-1]
+        logp_cr_g_pr = np.log(p_death)
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def death_proposal(self, current_state):
+        """Overloaded."""
+
+        prop_state = deepcopy(current_state)
+        prop_state[self.param] -= 1
+        ones_loc = jnp.argwhere(prop_state[self.indicator_var] == 1)
+        death_index = int(np.random.choice(np.array(ones_loc).flatten()))
+        prop_state[self.indicator_var] = prop_state[self.indicator_var].at[death_index].set(0)
+        # prop_state[self.indicator_var][death_index] = 0
+        death_location = "z" + str(death_index)
+        death_rate = "s" + str(death_index)
+
+         # TODO (13/06/25): next section could be done with "associated parameter" or something.
+        log_location_density, _ = self.model[death_location].log_p(prop_state, by_observation=True)
+        log_rate_density, _ = self.model[death_rate].log_p(prop_state)
+        log_prop_density = log_location_density + log_rate_density
+
+        p_birth, p_death = self.get_move_probabilities(current_state, False)
+        logp_pr_g_cr = np.log(p_death)
+        logp_cr_g_pr = np.log(p_birth) + log_prop_density[-1]
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def _accept_reject_proposal(self, current_state, prop_state, logp_pr_g_cr, logp_cr_g_pr):
+        """Overloaded."""
+        self.accept_rate.increment_proposal()
+        logp_cs = 0
+        logp_pr = 0
+        ct = 0
+        for rate, loc in self.source_variables.items():
+            if current_state[self.indicator_var][ct] == 1:
+                logp_cr_rate, _ = self.model[rate].log_p(current_state)
+                logp_cr_loc, _ = self.model[loc].log_p(current_state)
+                logp_cs += (logp_cr_rate + logp_cr_loc)
+            if prop_state[self.indicator_var][ct] == 1:
+                logp_pr_rate, _ = self.model[rate].log_p(prop_state)
+                logp_pr_loc, _ = self.model[loc].log_p(prop_state)
+                logp_pr += (logp_pr_rate + logp_pr_loc)
+            ct += 1
+        for var in self.other_variables:
+            logp_cr_dist, _ = self.model[var].log_p(current_state)
+            logp_cs += logp_cr_dist
+            logp_pr_dist, _ = self.model[var].log_p(prop_state)
+            logp_pr += logp_pr_dist
+        log_accept = logp_pr + logp_cr_g_pr - (logp_cs + logp_pr_g_cr)
+
+        if self.accept_proposal(log_accept):
+            current_state = prop_state
+            self.accept_rate.increment_accept()
+        return current_state
+
+
+@dataclass
+class NullSampler(MCMCSampler):
+    """Implementing null sampler, to enable stoarge of something that is not directly sampled."""
+
+    def sample(self, current_state: dict) -> dict:
+        """Overloaded sample function which does nothing."""
+        return current_state
