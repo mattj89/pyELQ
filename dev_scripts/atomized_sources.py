@@ -176,11 +176,6 @@ mcmc.run_mcmc()
 # NOTE: scaled identity added to the precision matrix in the mMALA sampler, to make it more stable. Should introduce
 # proper priors for the source locations and remove this.
 
-# NOTE (13/06/25): leaving it for the afternoon. Notes:
-# - currently working through debugger and solving issues as they arise.
-# - need to implement Uniform_jax and rvs methods for both this and the Normal_jax dist.
-# - Later: check line by line that the right A matrix columns are getting updated when samplers are hit.
-
 """
 Make some plots of the results (both cases).
 """
