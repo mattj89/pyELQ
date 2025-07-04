@@ -892,7 +892,10 @@ class SourceModelParameter(LinearCombination_jax):
         sensor_locations (dict):
 
     """
-    sensor_locations: dict
+    sensor_locations_x: dict
+    sensor_locations_y: dict
+    sensor_locations_z: dict
+    form: dict
     wind_speed: jnp.ndarray
     theta: jnp.ndarray
     wind_turbulence_horizontal: jnp.ndarray
@@ -936,7 +939,9 @@ class SourceModelParameter(LinearCombination_jax):
         """Sub-function for extracting and storing sensor location information."""
         source_map_enu = source_map.location
         # TODO (14/06/24): May need to handle the co-ordinate conversion- assuming ENU for now.
-        self.sensor_locations = {}
+        self.sensor_locations_x = {}
+        self.sensor_locations_y = {}
+        self.sensor_locations_z = {}
         for key, sensor in sensor_object.items():
             if isinstance(sensor, Beam):
                 enu_sensor_array = sensor.make_beam_knots(
@@ -952,7 +957,10 @@ class SourceModelParameter(LinearCombination_jax):
                     ref_altitude=source_map_enu.ref_altitude,
                 ).to_array()
                 enu_sensor_array = np.atleast_3d(enu_sensor_array)
-            self.sensor_locations[key] = jnp.array(enu_sensor_array)
+            jax_locations = jnp.array(enu_sensor_array)
+            self.sensor_locations_x[key] = jax_locations[:, [0], :]
+            self.sensor_locations_y[key] = jax_locations[:, [1], :]
+            self.sensor_locations_z[key] = jax_locations[:, [2], :]
 
     def extract_meteorology_information(self, meteorology_object):
         """Sub-function for extracting and storing meteorological information."""
@@ -988,15 +996,18 @@ class SourceModelParameter(LinearCombination_jax):
             update_index = list(range(self.n_sources_max))
         else:
             update_index = [update_index]
-        sensor_key_list = list(self.sensor_locations.keys())
+        sensor_key_list = list(self.sensor_locations_x.keys())
         for idx in update_index:
             source_key = "z" + str(idx)
             coupling_key = "A" + str(idx)
+            sensor_coupling_dict = {}
+            source_x = jnp.atleast_3d(state[source_key][[0], :])
+            source_y = jnp.atleast_3d(state[source_key][[1], :])
+            source_z = jnp.atleast_3d(state[source_key][[2], :])
             for sensor_key in sensor_key_list:
-                relative_x = self.sensor_locations[sensor_key][:, [0], :] - jnp.atleast_3d(state[source_key][[0], :])
-                relative_y = self.sensor_locations[sensor_key][:, [1], :] - jnp.atleast_3d(state[source_key][[1], :])
-                sensor_z = self.sensor_locations[sensor_key][:, [2], :]
-                source_z = jnp.atleast_3d(state[source_key][[2], :])
+                relative_x = self.sensor_locations_x[sensor_key] - source_x
+                relative_y = self.sensor_locations_y[sensor_key] - source_y
+                sensor_z = self.sensor_locations_z[sensor_key]
                 coupling_array = compute_coupling_array_jax(
                     sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
                     wind_speed=self.wind_speed[sensor_key], theta=self.theta[sensor_key],
@@ -1004,7 +1015,10 @@ class SourceModelParameter(LinearCombination_jax):
                     wind_turbulence_vertical=self.wind_turbulence_vertical[sensor_key],
                     gas_density=self.gas_density
                 )
-                state[coupling_key] = jnp.mean(coupling_array, axis=2)
+                sensor_coupling_dict[sensor_key] = jnp.mean(coupling_array, axis=2)
+            state[coupling_key] = jnp.concatenate(
+                [sensor_coupling_dict[key] for key in sensor_key_list], axis=0
+            )
         return state
 
 
@@ -1034,7 +1048,10 @@ class ScreenedManifoldMALA(ManifoldMALA):
 
     def proposal(self, current_state: dict) -> Tuple[dict, np.ndarray, np.ndarray]:
         """Overloaded proposal."""
-        prop_state = deepcopy(current_state)
+        # prop_state = deepcopy(current_state)
+        prop_state = current_state.copy()
+        prop_state[self.param] = jnp.copy(current_state[self.param])
+        # TODO (04/07/25): does this work? And do we also need to copy the coupling?
 
         mu_cr, chol_cr = self._proposal_params(current_state)
         prop_state[self.param] = gmrf.sample_normal(mu_cr, L=chol_cr)
@@ -1101,8 +1118,8 @@ class SourceReversibleJump(ReversibleJump):
 
         prop_state = deepcopy(current_state)
         prop_state[self.param] -= 1
-        ones_loc = jnp.argwhere(prop_state[self.indicator_var] == 1)
-        death_index = int(np.random.choice(np.array(ones_loc).flatten()))
+        ones_loc = jnp.argwhere(prop_state[self.indicator_var].flatten() == 1)
+        death_index = int(np.random.choice(np.array(ones_loc.flatten())))
         prop_state[self.indicator_var] = prop_state[self.indicator_var].at[death_index].set(0)
         # prop_state[self.indicator_var][death_index] = 0
         death_location = "z" + str(death_index)
@@ -1135,12 +1152,19 @@ class SourceReversibleJump(ReversibleJump):
                 logp_pr_loc, _ = self.model[loc].log_p(prop_state)
                 logp_pr += (logp_pr_rate + logp_pr_loc)
             ct += 1
-        for var in self.other_variables:
-            logp_cr_dist, _ = self.model[var].log_p(current_state)
-            logp_cs += logp_cr_dist
-            logp_pr_dist, _ = self.model[var].log_p(prop_state)
-            logp_pr += logp_pr_dist
-        log_accept = logp_pr + logp_cr_g_pr - (logp_cs + logp_pr_g_cr)
+        logp_cs_y, _ = self.model["y"].log_p(current_state)
+        logp_pr_y, _ = self.model["y"].log_p(prop_state)
+        logp_cs_rho, _ = self.model["n_src"].log_p(current_state)
+        logp_pr_rho, _ = self.model["n_src"].log_p(prop_state)
+        likelihood_diff = logp_pr_y - logp_cs_y
+        logp_pr += logp_pr_rho
+        logp_cs += logp_cs_rho
+        # for var in self.other_variables:
+        #     logp_cr_dist, _ = self.model[var].log_p(current_state)
+        #     logp_cs += logp_cr_dist
+        #     logp_pr_dist, _ = self.model[var].log_p(prop_state)
+        #     logp_pr += logp_pr_dist
+        log_accept = likelihood_diff + logp_pr + logp_cr_g_pr - (logp_cs + logp_pr_g_cr)
 
         if self.accept_proposal(log_accept):
             current_state = prop_state

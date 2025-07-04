@@ -38,21 +38,34 @@ from openmcmc.sampler.metropolis_hastings import ManifoldMALA
 from openmcmc.mcmc import MCMC
 from pyelq.component.source_model import SourceModelParameter, ScreenedManifoldMALA, SourceReversibleJump, NullSampler
 
+from pyelq.coordinate_system import LLA, ENU
+
 """"Generate the data"""
 
 model = generate_pyelq_test_model()
 model.n_iter = 20
 model.initialise()
 
+# extract real source locations and emission rates
+real_locations = np.concatenate((
+    np.atleast_2d(model.components["source"].dispersion_model.source_map.location.east),
+    np.atleast_2d(model.components["source"].dispersion_model.source_map.location.north),
+    np.atleast_2d(model.components["source"].dispersion_model.source_map.location.up)
+), axis=0)
+real_emission_rates = np.array([[15.0], [10.0]])
+num_real_sources = real_locations.shape[1]
+# TODO (03/07/25): make more robust
+
 """Run the MCMC for the original case"""
 
 model.to_mcmc()
+original_state = deepcopy(model.mcmc.state)
 model.run_mcmc()
 model.from_mcmc()
 
 """
 Configure the data likelihood.
-Test that the compilcation of the likelihood etc. is working.
+Test that the compilation of the likelihood etc. is working.
 """
 
 # create test state
@@ -61,15 +74,31 @@ state = {}
 # control max number of sources
 model.components["source"].n_sources_max = 10
 
+# choose the starting sources
+if False:
+    start_locations = real_locations
+else:
+    start_locations = np.random.uniform(
+        low=np.array([[0], [0], [0]]), high=np.array([[30], [30], [5]]), size=(3, real_locations.shape[1])
+    )
+
 # populate sources
 for i in range(model.components["source"].n_sources_max):
-    state["z" + str(i)] = jnp.array(
-        np.random.uniform(low=np.array([[0], [0], [0]]), high=np.array([[30], [30], [5]]), size=(3, 1))
-    )
+    if i < num_real_sources:
+        state["z" + str(i)] = jnp.array(
+            np.array([[start_locations[0, i]], [start_locations[1, i]], [start_locations[2, i]]])
+        )
+    else:
+        state["z" + str(i)] = jnp.array(
+            np.random.uniform(low=np.array([[0], [0], [0]]), high=np.array([[30], [30], [5]]), size=(3, 1))
+        )
 
 # populate emission rates
 for i in range(model.components["source"].n_sources_max):
-    state["s" + str(i)] = jnp.ones(shape=(1, 1))
+    if i < num_real_sources:
+        state["s" + str(i)] = jnp.array([[real_emission_rates[i, 0]]])
+    else:
+        state["s" + str(i)] = jnp.zeros(shape=(1, 1))
 
 # populate source on/off indicator
 state["q"] = jnp.zeros(shape=(model.components["source"].n_sources_max, 1))
@@ -80,10 +109,13 @@ for i in range(model.components["source"].n_sources_max):
         state["q"] = state["q"].at[i].set(0)
 state["n_src"] = int(jnp.sum(state["q"]))
 
+# convert the generated data to jnp
+state["y"] = jnp.array(original_state["y"])
+
 # populate coupling matrix
-n_data = 500
+n_data = state["y"].shape[0]
 for i in range(model.components["source"].n_sources_max):
-    state["A" + str(i)] = jnp.ones(shape=(n_data, 1))
+    state["A" + str(i)] = jnp.zeros(shape=(n_data, 1))
 
 # create predictor object
 form_dict = {"s" + str(i): "A" + str(i) for i in range(model.components["source"].n_sources_max)}
@@ -96,13 +128,13 @@ source_parameter = SourceModelParameter(
     n_sources_max=model.components["source"].n_sources_max,
 )
 
+# get the coupling columns corresponding to current locations
 test_array, _ = source_parameter.predictor(state)
 for i in range(model.components["source"].n_sources_max):
     state = source_parameter.update_prefactors(state, update_index=i)
-state["y"], _ = source_parameter.predictor(state)
 
 # other params in state
-state["Q"] = (10000.0) * jnp.eye(state["y"].size) # measurement error precision matrix
+state["Q"] = (100.0) * jnp.eye(state["y"].size) # measurement error precision matrix
 state["rho"] = np.array([2.0])  # Poisson rate for the number of sources
 
 # flag for jit compilation
@@ -160,7 +192,7 @@ mdl.response = {"y": "mean"}
 
 sampler_list = []
 for i in range(model.components["source"].n_sources_max):
-    sampler_list.append(ScreenedManifoldMALA("z" + str(i), mdl, step=0.2, parameter_index=i))
+    sampler_list.append(ScreenedManifoldMALA("z" + str(i), mdl, step=0.5, parameter_index=i))
     sampler_list.append(NormalNormal("s" + str(i), mdl))
 sampler_list.append(SourceReversibleJump(
     "n_src", mdl, step=np.array([1.0], ndmin=2),
@@ -170,7 +202,7 @@ sampler_list.append(SourceReversibleJump(
 sampler_list.append(NullSampler("q", mdl))
 
 initial_state = deepcopy(state)
-mcmc = MCMC(initial_state, sampler_list, model=mdl, n_burn=10, n_iter=500)
+mcmc = MCMC(initial_state, sampler_list, model=mdl, n_burn=250, n_iter=250)
 mcmc.run_mcmc()
 
 # NOTE: scaled identity added to the precision matrix in the mMALA sampler, to make it more stable. Should introduce
@@ -182,26 +214,31 @@ Make some plots of the results (both cases).
 
 # plot the fit to the data
 fig = go.Figure()
-y_mean = mcmc.store["y"].mean(axis=1)
-y_std = mcmc.store["y"].std(axis=1)
-fig.add_trace(
-    go.Scatter(
-        x=np.arange(initial_state["y"].shape[0]),
-        y=initial_state["y"][:, 0],
-        mode="lines",
-        name="Observed data",
-        line=dict(color='red')
+data_shape = (len(model.sensor_object), model.sensor_object["Beam sensor 0"].nof_observations)
+y_mean = np.reshape(mcmc.store["y"].mean(axis=1), data_shape).T
+y_std = np.reshape(mcmc.store["y"].std(axis=1), data_shape).T
+y_data = np.reshape(initial_state["y"][:, 0], data_shape).T
+k = 0
+for sensor_key, sensor in model.sensor_object.items():
+    fig.add_trace(
+        go.Scatter(
+            x=sensor.time,
+            y=y_data[:, k],
+            mode="markers",
+            name="Observed data",
+            marker=dict(color=model.sensor_object.color_map[k]),
+        )
     )
-)
-fig.add_trace(
-    go.Scatter(
-        x=np.arange(mcmc.store["y"].shape[0]),
-        y=y_mean,
-        mode="lines",
-        name="Mean fit",
-        line=dict(color='blue')
+    fig.add_trace(
+        go.Scatter(
+            x=sensor.time,
+            y=y_mean[:, k],
+            mode="lines",
+            name="Mean fit",
+            line=dict(color=model.sensor_object.color_map[k])
+        )
     )
-)
+    k += 1
 fig.show()
 
 # plot the traces of the sources
@@ -212,18 +249,37 @@ for i in range(model.components["source"].n_sources_max):
     emission_name = "s" + str(i)
     on_index = mcmc.store["q"][i, :] == 1
     location_series = mcmc.store[location_name][:, on_index]
+    enu_object = ENU(east=location_series[0, :], north=location_series[1, :], up=location_series[2, :],
+                     ref_latitude=0.0, ref_longitude=0.0, ref_altitude=0.0)
+    lla_object = enu_object.to_lla()
     emission_series = mcmc.store[emission_name][:, on_index]
     fig.add_trace(
-        go.Scatter(
-            x=location_series[0, :],
-            y=location_series[1, :],
+            go.Scattermap(
+                mode="markers",
+                lat=np.array(lla_object.latitude),
+                lon=np.array(lla_object.longitude),
+                marker=dict(
+                    size=10,
+                    color=emission_series[0, :],
+                    coloraxis="coloraxis",
+                ),
+                showlegend=False
+            )
+        )
+for i in range(real_locations.shape[1]):
+    enu_object = ENU(east=real_locations[0, i], north=real_locations[1, i], up=0.0,
+                     ref_latitude=0.0, ref_longitude=0.0, ref_altitude=0.0)
+    lla_object = enu_object.to_lla()
+    fig.add_trace(
+        go.Scattermap(
             mode="markers",
+            lat=np.array(lla_object.latitude),
+            lon=np.array(lla_object.longitude),
             marker=dict(
                 size=10,
-                color=emission_series[0, :],
-                coloraxis="coloraxis",
+                color="black"
             ),
-            showlegend=False
+            name=f"Real source {i+1}"
         )
     )
 fig.update_layout(coloraxis = {'colorscale':'jet'})

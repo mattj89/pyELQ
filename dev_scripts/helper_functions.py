@@ -80,8 +80,8 @@ def make_meteorology(time_points: pd.array) -> Meteorology:
     nof_observations = time_points.size
     met_object = Meteorology()
     met_object.time = time_points
-    met_object.wind_direction = np.linspace(0.0, 90.0, nof_observations) + np.random.normal(loc=0.0, scale=0.1, size=nof_observations)
-    met_object.wind_speed = 4.0 * np.ones_like(met_object.wind_direction) + np.random.normal(loc=0.0, scale=0.1, size=nof_observations)
+    met_object.wind_direction = np.linspace(0.0, 360.0, nof_observations) + np.random.normal(loc=0.0, scale=0.01, size=nof_observations)
+    met_object.wind_speed = 4.0 * np.ones_like(met_object.wind_direction) + np.random.normal(loc=0.0, scale=0.01, size=nof_observations)
     met_object.calculate_uv_from_wind_speed_direction()
     met_object.temperature = (273.1 + 15.0) * np.ones_like(met_object.wind_direction)
     met_object.pressure = 101.325 * np.ones_like(met_object.wind_direction)
@@ -109,7 +109,7 @@ def make_dispersion_model(
     ) -> GaussianPlume:
     """Create the dispersion model from the previously-specified source map & sensor configuration."""
     dispersion_model = GaussianPlume(source_map=deepcopy(source_map))
-    true_emission_rates = np.array([[15], [10]])
+    true_emission_rates = np.array([[15.0], [10.0]])
     for current_sensor in sensor_group.values():
         coupling_matrix = dispersion_model.compute_coupling(sensor_object=current_sensor, meteorology_object=met_object,
                                                             gas_object=gas_object, output_stacked=False, run_interpolation=False)
@@ -119,7 +119,7 @@ def make_dispersion_model(
     return dispersion_model, sensor_group
 
 
-def preprocess_data(sensor_group: SensorGroup, met_object: Meteorology, smoothing_period: int = 20) -> Preprocessor:
+def preprocess_data(sensor_group: SensorGroup, met_object: Meteorology, smoothing_period: int = 120) -> Preprocessor:
     analysis_time_range = [datetime.datetime(2024, 1, 1, 8, 0, 0), datetime.datetime(2024, 1, 1, 12, 0, 0)]
     time_bin_edges = pd.array(pd.date_range(analysis_time_range[0], analysis_time_range[1], freq=f'{smoothing_period}s'), dtype='datetime64[ns]')
     prepocessor_object = Preprocessor(time_bin_edges=time_bin_edges, sensor_object=sensor_group, met_object=met_object,
@@ -175,8 +175,8 @@ def generate_pyelq_test_model(
     met_object = make_meteorology(time_axis)
     source_map, site_limits = make_source_map(nof_sources=nof_sources)
     gas_object = CH4()
-    prp_object = preprocess_data(sensor_group=sensor_group, met_object=met_object)
     dispersion_model, sensor_group = make_dispersion_model(source_map, sensor_group, met_object, gas_object)
+    prp_object = preprocess_data(sensor_group=sensor_group, met_object=met_object)
     source_model, background_model, offset_model, error_model = make_default_pyelq_inputs(dispersion_model, site_limits)
     model = ELQModel(
         sensor_object=prp_object.sensor_object,
