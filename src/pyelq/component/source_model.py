@@ -22,14 +22,16 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Tuple, Union
 
 import numpy as np
+import scipy.stats as stats
 import jax.numpy as jnp
+import jax.core as core
 
 from openmcmc import parameter
 from openmcmc import gmrf
 from openmcmc.distribution.distribution import Categorical, Gamma, Poisson, Uniform
 from openmcmc.distribution.location_scale import Normal as mcmcNormal
 from openmcmc.model import Model
-from openmcmc.sampler.metropolis_hastings import RandomWalkLoop, ManifoldMALA
+from openmcmc.sampler.metropolis_hastings import RandomWalkLoop, ManifoldMALA, MetropolisHastings
 from openmcmc.sampler.reversible_jump import ReversibleJump
 from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal, MCMCSampler
 from openmcmc.parameter_jax import LinearCombination_jax
@@ -926,11 +928,16 @@ class SourceModelParameter(LinearCombination_jax):
         if isinstance(term_to_exclude, str):
             term_to_exclude = [term_to_exclude]
 
+        is_jit = isinstance(jnp.array(0), core.Tracer)
         sum_terms = 0
         ct = 0
         for prm, prefactor in self.form.items():
-            if prm not in term_to_exclude:
-                sum_terms += state["q"][ct] * (state[prefactor] @ state[prm])
+            if is_jit:
+                if prm not in term_to_exclude:
+                    sum_terms += state["q"][ct] * (state[prefactor] @ state[prm])
+            else:
+                if prm not in term_to_exclude and state["q"][ct] == 1:
+                    sum_terms += state[prefactor] @ state[prm]
             ct += 1
         # TODO (17/06/25): robustify this counting mechanism.
         return sum_terms
@@ -997,6 +1004,7 @@ class SourceModelParameter(LinearCombination_jax):
         else:
             update_index = [update_index]
         sensor_key_list = list(self.sensor_locations_x.keys())
+        state_out = state.copy()
         for idx in update_index:
             source_key = "z" + str(idx)
             coupling_key = "A" + str(idx)
@@ -1016,10 +1024,10 @@ class SourceModelParameter(LinearCombination_jax):
                     gas_density=self.gas_density
                 )
                 sensor_coupling_dict[sensor_key] = jnp.mean(coupling_array, axis=2)
-            state[coupling_key] = jnp.concatenate(
+            state_out[coupling_key] = jnp.concatenate(
                 [sensor_coupling_dict[key] for key in sensor_key_list], axis=0
             )
-        return state
+        return state_out
 
 
 @dataclass
@@ -1068,6 +1076,60 @@ class ScreenedManifoldMALA(ManifoldMALA):
 
 
 @dataclass
+class HamiltonianMonteCarlo(MetropolisHastings):
+    """Implementation of Hamiltonian Monte Carlo for this instance.
+    """
+    momentum_precision: np.array = 1.0
+    epsilon: float = 0.01
+    num_leapfrog_steps: int = 10
+    parameter_index: int = None
+
+    def sample(self, current_state: dict) -> dict:
+        """Overloaded version of the sample function which screens on the RJ on/off variable.
+
+        Args:
+            current_state (dict): The current state of the MCMC sampler.
+
+        Returns:
+            dict: The updated state after sampling. This is unchanged if state["qi"] == 0.
+
+        """
+        num_source = int(self.param[1:])
+        if current_state["q"][num_source] == 1:
+            return super().sample(current_state)
+        return current_state
+
+    def proposal(self, current_state: dict):
+        """Make a HMC proposal."""
+        prop_state = deepcopy(current_state)
+        initial_momentum = self._sample_initial_momentum(current_state)
+        momentum = initial_momentum.copy()
+
+        grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
+        momentum -= (self.epsilon / 2) * grad_cr
+        for k in range(self.num_leapfrog_steps):
+            prop_state[self.param] += self.epsilon * momentum
+            _, prop_state = self.model["y"].log_p(prop_state, update_index=self.parameter_index)
+            if k < self.num_leapfrog_steps - 1:
+                grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
+                momentum -= self.epsilon * grad_cr
+        momentum -= (self.epsilon / 2) * grad_cr
+
+        logp_pr_g_cr = self._evaluate_momentum_density(initial_momentum)
+        logp_cr_g_pr = self._evaluate_momentum_density(momentum)
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def _evaluate_momentum_density(self, momentum: np.ndarray) -> float:
+        """Evaluate the log-density of the momentum variable."""
+        return -0.5 * momentum.T @ (self.momentum_precision @ momentum)
+
+    def _sample_initial_momentum(self, current_state: dict) -> np.ndarray:
+        """Sample initial momentum from a Gaussian distribution."""
+        mean = np.zeros(current_state[self.param].shape)
+        return gmrf.sample_normal(mu=mean, Q=self.momentum_precision)
+
+
+@dataclass
 class SourceReversibleJump(ReversibleJump):
     """Overloaded version of the ReversibleJump sampler, which handles the atomized source set up
 
@@ -1076,6 +1138,7 @@ class SourceReversibleJump(ReversibleJump):
     """
     indicator_var: str = "q"
     source_variables: dict = None
+    proposal_scale: float = 1.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -1098,18 +1161,22 @@ class SourceReversibleJump(ReversibleJump):
 
         # TODO (13/06/25): next section could be done with "associated parameter" or something.
         prop_state[birth_location] = self.model[birth_location].rvs(state=prop_state, n=1)
-        prop_state[birth_rate] = self.model[birth_rate].rvs(state=prop_state, n=1)
+        # prop_state[birth_rate] = self.model[birth_rate].rvs(state=prop_state, n=1)
         log_location_density, _ = self.model[birth_location].log_p(prop_state, by_observation=True)
-        log_rate_density, _ = self.model[birth_rate].log_p(prop_state)
-        log_prop_density = log_location_density + log_rate_density
+        # log_rate_density, _ = self.model[birth_rate].log_p(prop_state)
+        log_prop_density = log_location_density
+        logp_pr_g_cr, logp_cr_g_pr = 0.0, 0.0
 
         # update coupling matrix element
         # prop_state = self.model["y"].mean.update_prefactors(prop_state, update_index=birth_index)
         _, prop_state = self.model["y"].log_p(prop_state, update_index=birth_index)
+        prop_state, logp_pr_g_cr, logp_cr_g_pr = self.matched_birth_transition(
+            current_state, prop_state, logp_pr_g_cr, logp_cr_g_pr, birth_index
+        )
 
         p_birth, p_death = self.get_move_probabilities(current_state, True)
-        logp_pr_g_cr = np.log(p_birth) + log_prop_density[-1]
-        logp_cr_g_pr = np.log(p_death)
+        logp_pr_g_cr += np.log(p_birth) + log_prop_density[-1]
+        logp_cr_g_pr += np.log(p_death)
 
         return prop_state, logp_pr_g_cr, logp_cr_g_pr
 
@@ -1127,12 +1194,100 @@ class SourceReversibleJump(ReversibleJump):
 
          # TODO (13/06/25): next section could be done with "associated parameter" or something.
         log_location_density, _ = self.model[death_location].log_p(prop_state, by_observation=True)
-        log_rate_density, _ = self.model[death_rate].log_p(prop_state)
-        log_prop_density = log_location_density + log_rate_density
+        # log_rate_density, _ = self.model[death_rate].log_p(prop_state)
+        log_prop_density = log_location_density
+        logp_pr_g_cr, logp_cr_g_pr = 0.0, 0.0
+        prop_state, logp_pr_g_cr, logp_cr_g_pr = self.matched_death_transition(
+            current_state, prop_state, logp_pr_g_cr, logp_cr_g_pr, death_index
+        )
 
         p_birth, p_death = self.get_move_probabilities(current_state, False)
-        logp_pr_g_cr = np.log(p_death)
-        logp_cr_g_pr = np.log(p_birth) + log_prop_density[-1]
+        logp_pr_g_cr += np.log(p_death)
+        logp_cr_g_pr += np.log(p_birth) + log_prop_density[-1]
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def create_arrays(self, state: dict, index: int = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Create arrays for the coupling and emissions from the state dictionary."""
+        coupling = jnp.empty((state["A0"].shape[0], 0))
+        emissions = jnp.empty((0, 1))
+        ct = 0
+        for k in range(self.n_max):
+            if state[self.indicator_var][k] == 1:
+                coupling = jnp.concatenate((coupling, state["A" + str(k)]), axis=1)
+                emissions = jnp.concatenate((emissions, state["s" + str(k)]), axis=0)
+                if k == index:
+                    local_index = ct
+                ct += 1
+        if index is not None:
+            return coupling, emissions, local_index
+        else:
+            return coupling, emissions
+
+    def matched_birth_transition(
+        self, current_state: dict, prop_state: dict, logp_pr_g_cr: float, logp_cr_g_pr: float, birth_index: int
+    ) -> Tuple[dict, float, float]:
+        """Overloaded birth transition function for the emissions that works with JAX arrays."""
+        coupling_current, emissions_current = self.create_arrays(current_state)
+        coupling_proposed, emissions_proposed, birth_local_index = self.create_arrays(prop_state, birth_index)
+
+        G = jnp.linalg.solve(
+            coupling_proposed.T @ coupling_proposed + (1e-8) * jnp.eye(coupling_proposed.shape[1]),
+            coupling_proposed.T @ coupling_current
+        )
+        F = jnp.insert(G, obj=birth_local_index, values=jnp.eye(N=G.shape[0], M=1, k=-birth_local_index).flatten(), axis=1)
+        mu_star = G @ emissions_current
+        emissions_prop = mu_star.copy()
+        emissions_prop = emissions_prop.at[birth_local_index].set(
+            gmrf.truncated_normal_rv(
+                mean=emissions_prop.at[birth_local_index].get(), scale=self.proposal_scale, lower=0.0, upper=1e6, size=1
+            )
+        )
+        ct = 0
+        for k in range(self.n_max):
+            if prop_state[self.indicator_var].at[k].get() == 1:
+                prop_state["s" + str(k)] = mu_star[[ct], :]
+                ct += 1
+        # logp_pr_g_cr += gmrf.truncated_normal_log_pdf(
+        #     emissions_prop.at[birth_local_index].get(), mu_star.at[birth_local_index].get(), self.proposal_scale, lower=0.0, upper=1e6
+        # )
+        logp_pr_g_cr += stats.norm.logpdf(
+            emissions_prop.at[birth_local_index].get(), mu_star.at[birth_local_index].get(), self.proposal_scale
+        )
+        logp_cr_g_pr += jnp.log(jnp.linalg.det(F))
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def matched_death_transition(
+            self, current_state: dict, prop_state: dict, logp_pr_g_cr: float, logp_cr_g_pr: float, death_index: int
+    ) -> Tuple[dict, float, float]:
+        """Overloaded death transition function for the emissions that works with JAX arrays."""
+        proposal_scale = 0.1
+
+        coupling_current, emissions_current, death_local_index = self.create_arrays(current_state, death_index)
+        coupling_proposed, emissions_proposed = self.create_arrays(prop_state)
+
+        G = jnp.linalg.solve(
+            coupling_current.T @ coupling_current + (1e-8) * jnp.eye(coupling_current.shape[1]),
+            coupling_current.T @ coupling_proposed
+        )
+        F = jnp.insert(G, obj=death_local_index, values=jnp.eye(N=G.shape[0], M=1, k=-death_local_index).flatten(), axis=1)
+        mu_aug = jnp.linalg.solve(F, emissions_current)
+        param_del = mu_aug.at[death_local_index].get()
+        param_rem = jnp.delete(mu_aug, obj=death_local_index, axis=0)
+        ct = 0
+        for k in range(self.n_max):
+            if prop_state[self.indicator_var].at[k].get() == 1:
+                prop_state["s" + str(k)] = param_rem[[ct], :]
+                ct += 1
+
+        logp_pr_g_cr += jnp.log(jnp.linalg.det(F))
+        # logp_cr_g_pr += gmrf.truncated_normal_log_pdf(
+        #     param_del, 0.0, self.proposal_scale, lower=0.0, upper=1e6
+        # )
+        logp_cr_g_pr += stats.norm.logpdf(
+            param_del, 0.0, self.proposal_scale
+        )
 
         return prop_state, logp_pr_g_cr, logp_cr_g_pr
 
@@ -1143,11 +1298,11 @@ class SourceReversibleJump(ReversibleJump):
         logp_pr = 0
         ct = 0
         for rate, loc in self.source_variables.items():
-            if current_state[self.indicator_var][ct] == 1:
+            if current_state[self.indicator_var].at[ct].get() == 1:
                 logp_cr_rate, _ = self.model[rate].log_p(current_state)
                 logp_cr_loc, _ = self.model[loc].log_p(current_state)
                 logp_cs += (logp_cr_rate + logp_cr_loc)
-            if prop_state[self.indicator_var][ct] == 1:
+            if prop_state[self.indicator_var].at[ct].get() == 1:
                 logp_pr_rate, _ = self.model[rate].log_p(prop_state)
                 logp_pr_loc, _ = self.model[loc].log_p(prop_state)
                 logp_pr += (logp_pr_rate + logp_pr_loc)
