@@ -67,7 +67,7 @@ for sensor in range(nof_sensors):
         longitude=np.array([reference_longitude, LLA_object.longitude[sensor]]),
         altitude=np.array([5.0, LLA_object.altitude[sensor]])
     )
-    
+
     new_sensor.time = time_axis
     new_sensor.concentration = np.zeros(nof_observations)
     sensor_group.add_sensor(new_sensor)
@@ -89,7 +89,7 @@ for sensor in range(nof_sensors):
         longitude=np.array([LLA_object.longitude[sensor]]),
         altitude=np.array([LLA_object.altitude[sensor]])
     )
-    
+
     new_sensor.time = time_axis
     new_sensor.concentration = np.zeros(nof_observations)
     sensor_group.add_sensor(new_sensor)
@@ -174,7 +174,7 @@ Process the synthetic data
 
 analysis_time_range = [datetime.datetime(2024, 1, 1, 8, 0, 0), datetime.datetime(2024, 1, 1, 12, 0, 0)]
 
-smoothing_period = 10 * 60
+smoothing_period = 5 * 60
 
 time_bin_edges = pd.array(pd.date_range(analysis_time_range[0], analysis_time_range[1], freq=f'{smoothing_period}s'), dtype='datetime64[ns]')
 
@@ -182,7 +182,7 @@ prepocessor_object = Preprocessor(time_bin_edges=time_bin_edges, sensor_object=s
                                   aggregate_function="median")
 
 min_wind_speed = 0.05
-prepocessor_object.filter_on_met(filter_variable=["wind_speed"], lower_limit=[min_wind_speed], upper_limit=[np.infty])
+prepocessor_object.filter_on_met(filter_variable=["wind_speed"], lower_limit=[min_wind_speed], upper_limit=[np.inf])
 
 """
 Create the "classic" version of the model.
@@ -245,8 +245,8 @@ likelihood_y.param_list = ["s", "z"]
 
 # set up the prior distrbution for the emission rates
 prior_s = Normal_jax(
-    response="s", grad_list=["s"], 
-    mean=parameter_jax.Identity_jax(form="mu_s"), 
+    response="s", grad_list=["s"],
+    mean=parameter_jax.Identity_jax(form="mu_s"),
     precision=parameter_jax.Identity_jax(form="P_s")
 )
 prior_s.param_list = ["s"]
@@ -304,7 +304,7 @@ perturbed_state["z"] = perturbed_state["z"] + jnp.array([[1, 1, 0],
                                                          [1, 1, 0]]).T
 # NOTE (06/08/24): If I start this np.sqrt(2) metres away from the source, then it works fine (high acceptance rate).
 # If I start 2 metres away without changing the step size, then it gets 0% acceptance.
-# The Hessian is position-dependent, so 
+# The Hessian is position-dependent, so
 
 # set up the MCMC object
 mcmc = MCMC(perturbed_state, sampler, model=mdl, n_burn=2000, n_iter=5000)

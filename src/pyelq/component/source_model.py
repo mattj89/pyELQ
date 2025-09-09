@@ -22,16 +22,19 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Tuple, Union
 
 import numpy as np
+import scipy.stats as stats
 import jax.numpy as jnp
+import jax.core as core
 
 from openmcmc import parameter
+from openmcmc import gmrf
 from openmcmc.distribution.distribution import Categorical, Gamma, Poisson, Uniform
 from openmcmc.distribution.location_scale import Normal as mcmcNormal
 from openmcmc.model import Model
-from openmcmc.sampler.metropolis_hastings import RandomWalkLoop
+from openmcmc.sampler.metropolis_hastings import RandomWalkLoop, ManifoldMALA, MetropolisHastings
 from openmcmc.sampler.reversible_jump import ReversibleJump
-from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal
-from openmcmc.parameter_jax import Parameter_jax, LinearCombinationDependent_jax
+from openmcmc.sampler.sampler import MixtureAllocation, NormalGamma, NormalNormal, MCMCSampler
+from openmcmc.parameter_jax import LinearCombination_jax
 
 from pyelq.component.component import Component
 from pyelq.coordinate_system import ENU
@@ -429,6 +432,8 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
 
         reversible_jump (bool): logical indicating whether the reversible jump algorithm for estimation of the number
             of sources and their locations should be run. Defaults to False.
+        random_walk_step_size (np.ndarray): (3 x 1) array specifying the standard deviations of the distributions
+            from which the random walk sampler draws new source locations. Defaults to np.array([1.0, 1.0, 0.1]).
         site_limits (np.ndarray): (3 x 2) array specifying the lower (column 0) and upper (column 1) limits of the
             analysis site. Only relevant for cases where reversible_jump == True (where sources are free to move in
             the solution).
@@ -452,6 +457,10 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
         coverage_detection (float): sensor detection threshold (in ppm) to be used for coverage calculations.
         coverage_test_source (float): test source (in kg/hr) which we wish to be able to see in coverage calculation.
 
+        threshold_function (Callable): Callable function which returns a single value that defines the threshold
+            for the coupling in a lambda function form. Examples: lambda x: np.quantile(x, 0.95, axis=0),
+            lambda x: np.max(x, axis=0), lambda x: np.mean(x, axis=0). Defaults to np.quantile.
+
     """
 
     dispersion_model: GaussianPlume = field(init=False, default=None)
@@ -462,6 +471,7 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
     gas_species: GasSpecies = field(init=False, default=None)
 
     reversible_jump: bool = False
+    random_walk_step_size: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 0.1], ndmin=2).T)
     site_limits: np.ndarray = None
     rate_num_sources: int = 5
     n_sources_max: int = 20
@@ -475,6 +485,8 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
 
     coverage_detection: float = 0.1
     coverage_test_source: float = 6.0
+
+    threshold_function: callable = lambda x: np.quantile(x, 0.95, axis=0)
 
     @property
     def nof_sources(self):
@@ -547,7 +559,7 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
     def screen_coverage(self):
         """Screen the initial source map for coverage."""
         in_coverage_area = self.dispersion_model.compute_coverage(
-            self.coupling, coverage_threshold=self.coverage_threshold
+            self.coupling, coverage_threshold=self.coverage_threshold, threshold_function=self.threshold_function
         )
         self.coupling = self.coupling[:, in_coverage_area]
         all_locations = self.dispersion_model.source_map.location.to_array()
@@ -627,7 +639,9 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
         prop_state = self.update_coupling_column(prop_state, int(prop_state["n_src"]) - 1)
         prop_state["alloc_s"] = np.concatenate((prop_state["alloc_s"], np.array([0], ndmin=2)), axis=0)
         in_cov_area = self.dispersion_model.compute_coverage(
-            prop_state["A"][:, -1], coverage_threshold=self.coverage_threshold
+            prop_state["A"][:, -1],
+            coverage_threshold=self.coverage_threshold,
+            threshold_function=self.threshold_function,
         )
         if not in_cov_area:
             logp_pr_g_cr = 1e10
@@ -686,7 +700,9 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
         prop_state = deepcopy(current_state)
         prop_state = self.update_coupling_column(prop_state, update_column)
         in_cov_area = self.dispersion_model.compute_coverage(
-            prop_state["A"][:, update_column], coverage_threshold=self.coverage_threshold
+            prop_state["A"][:, update_column],
+            coverage_threshold=self.coverage_threshold,
+            threshold_function=self.threshold_function,
         )
         if not in_cov_area:
             prop_state = deepcopy(current_state)
@@ -782,7 +798,7 @@ class SourceModel(Component, SourceGrouping, SourceDistribution):
             RandomWalkLoop(
                 "z_src",
                 model,
-                step=np.array([1.0, 1.0, 0.1], ndmin=2).T,
+                step=self.random_walk_step_size,
                 max_variable_size=(3, self.n_sources_max),
                 domain_limits=self.site_limits,
                 state_update_function=self.move_function,
@@ -867,25 +883,29 @@ class NormalSlabAndSpike(SourceModel, SlabAndSpike, NormalResponse):
 
 
 @dataclass
-class SourceModelParameter(LinearCombinationDependent_jax):
+class SourceModelParameter(LinearCombination_jax):
     """Parameter class for the source model, which allows for updating of the coupling matrix as part of the
     log-likelihood calls.
 
     Initialization of the parameter class extracts the sensor locations and meteorology information from the objects
-    passed in, converts them to jax.numpy arrays and stores them locally on the class. 
+    passed in, converts them to jax.numpy arrays and stores them locally on the class.
 
     Attributes:
-        sensor_locations (dict): 
-    
+        sensor_locations (dict):
+
     """
-    sensor_locations: dict
+    sensor_locations_x: dict
+    sensor_locations_y: dict
+    sensor_locations_z: dict
+    form: dict
     wind_speed: jnp.ndarray
     theta: jnp.ndarray
     wind_turbulence_horizontal: jnp.ndarray
     wind_turbulence_vertical: jnp.ndarray
     gas_density: jnp.ndarray
+    n_sources_max: int
 
-    def __init__(self, form, sensor_object, meteorology_object, gas_species, source_map):
+    def __init__(self, form, sensor_object, meteorology_object, gas_species, source_map, n_sources_max):
         """Function which takes the pyELQ data sensor and meteorology objects, converts the relevant attributes to
         jax.numpy objects, and attaches them to the class ready for repeated use in the sampler.
 
@@ -896,12 +916,39 @@ class SourceModelParameter(LinearCombinationDependent_jax):
         self.extract_sensor_information(sensor_object, source_map)
         self.extract_meteorology_information(meteorology_object)
         self.gas_density = jnp.array(gas_species.gas_density())
+        self.n_sources_max = n_sources_max
+
+    def predictor_conditional(self, state, term_to_exclude = None):
+        """Overloaded version, to take account of the fact that the terms are being screened in/out by the RJ
+        indicator.
+        """
+        if term_to_exclude is None:
+            term_to_exclude = []
+
+        if isinstance(term_to_exclude, str):
+            term_to_exclude = [term_to_exclude]
+
+        is_jit = isinstance(jnp.array(0), core.Tracer)
+        sum_terms = 0
+        ct = 0
+        for prm, prefactor in self.form.items():
+            if is_jit:
+                if prm not in term_to_exclude:
+                    sum_terms += state["q"][ct] * (state[prefactor] @ state[prm])
+            else:
+                if prm not in term_to_exclude and state["q"][ct] == 1:
+                    sum_terms += state[prefactor] @ state[prm]
+            ct += 1
+        # TODO (17/06/25): robustify this counting mechanism.
+        return sum_terms
 
     def extract_sensor_information(self, sensor_object, source_map):
         """Sub-function for extracting and storing sensor location information."""
         source_map_enu = source_map.location
         # TODO (14/06/24): May need to handle the co-ordinate conversion- assuming ENU for now.
-        self.sensor_locations = {}
+        self.sensor_locations_x = {}
+        self.sensor_locations_y = {}
+        self.sensor_locations_z = {}
         for key, sensor in sensor_object.items():
             if isinstance(sensor, Beam):
                 enu_sensor_array = sensor.make_beam_knots(
@@ -917,7 +964,10 @@ class SourceModelParameter(LinearCombinationDependent_jax):
                     ref_altitude=source_map_enu.ref_altitude,
                 ).to_array()
                 enu_sensor_array = np.atleast_3d(enu_sensor_array)
-            self.sensor_locations[key] = jnp.array(enu_sensor_array)
+            jax_locations = jnp.array(enu_sensor_array)
+            self.sensor_locations_x[key] = jax_locations[:, [0], :]
+            self.sensor_locations_y[key] = jax_locations[:, [1], :]
+            self.sensor_locations_z[key] = jax_locations[:, [2], :]
 
     def extract_meteorology_information(self, meteorology_object):
         """Sub-function for extracting and storing meteorological information."""
@@ -934,7 +984,7 @@ class SourceModelParameter(LinearCombinationDependent_jax):
             self.wind_turbulence_vertical[key] = \
                 jnp.array(meteo.wind_turbulence_vertical).reshape((meteo.wind_turbulence_vertical.shape[0], 1, 1))
 
-    def update_prefactors(self, state: dict, **kwargs) -> dict:
+    def update_prefactors(self, state: dict, update_index: list = None) -> dict:
         """Update the coupling matrix based on the information in the state.
 
         Accounts for the situation where e.g. the source location or the wind sigma parameters change during the MCMC.
@@ -949,20 +999,338 @@ class SourceModelParameter(LinearCombinationDependent_jax):
             state (dict): dictionary containing current state information.
 
         """
-        key_list = list(self.sensor_locations.keys())
-        state["A"] = jnp.empty(shape=(0, state["z"].shape[1]))
-        for key in key_list:
-            relative_x = self.sensor_locations[key][:, [0], :] - jnp.atleast_3d(state["z"][[0], :])
-            relative_y = self.sensor_locations[key][:, [1], :] - jnp.atleast_3d(state["z"][[1], :])
-            sensor_z = self.sensor_locations[key][:, [2], :]
-            source_z = jnp.atleast_3d(state["z"][[2], :])
-            coupling_array = compute_coupling_array_jax(
-                sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
-                wind_speed=self.wind_speed[key], theta=self.theta[key],
-                wind_turbulence_horizontal=self.wind_turbulence_horizontal[key],
-                wind_turbulence_vertical=self.wind_turbulence_vertical[key],
-                gas_density=self.gas_density
+        if update_index is None:
+            update_index = list(range(self.n_sources_max))
+        else:
+            update_index = [update_index]
+        sensor_key_list = list(self.sensor_locations_x.keys())
+        state_out = state.copy()
+        for idx in update_index:
+            source_key = "z" + str(idx)
+            coupling_key = "A" + str(idx)
+            sensor_coupling_dict = {}
+            source_x = jnp.atleast_3d(state[source_key][[0], :])
+            source_y = jnp.atleast_3d(state[source_key][[1], :])
+            source_z = jnp.atleast_3d(state[source_key][[2], :])
+            for sensor_key in sensor_key_list:
+                relative_x = self.sensor_locations_x[sensor_key] - source_x
+                relative_y = self.sensor_locations_y[sensor_key] - source_y
+                sensor_z = self.sensor_locations_z[sensor_key]
+                coupling_array = compute_coupling_array_jax(
+                    sensor_x=relative_x, sensor_y=relative_y, sensor_z=sensor_z, source_z=source_z,
+                    wind_speed=self.wind_speed[sensor_key], theta=self.theta[sensor_key],
+                    wind_turbulence_horizontal=self.wind_turbulence_horizontal[sensor_key],
+                    wind_turbulence_vertical=self.wind_turbulence_vertical[sensor_key],
+                    gas_density=self.gas_density
+                )
+                sensor_coupling_dict[sensor_key] = jnp.mean(coupling_array, axis=2)
+            state_out[coupling_key] = jnp.concatenate(
+                [sensor_coupling_dict[key] for key in sensor_key_list], axis=0
             )
-            coupling_array = jnp.mean(coupling_array, axis=2) 
-            state["A"] = jnp.concatenate((state["A"], coupling_array), axis=0)
-        return state
+        return state_out
+
+
+@dataclass
+class ScreenedManifoldMALA(ManifoldMALA):
+    """Version of ManifoldMALA sampler which screens on the RJ on/off variable.
+
+    If state["qi"] == 1 for i = 1,2,...,n, then a sample is generated for source i using the usual functionality.
+    If state["qi"] == 0, then the source i is not sampled, and the coupling matrix is not updated for that source.
+    """
+    parameter_index: int = None
+
+    def sample(self, current_state: dict) -> dict:
+        """Overloaded version of the sample function which screens on the RJ on/off variable.
+
+        Args:
+            current_state (dict): The current state of the MCMC sampler.
+
+        Returns:
+            dict: The updated state after sampling. This is unchanged if state["qi"] == 0.
+
+        """
+        num_source = int(self.param[1:])
+        if current_state["q"][num_source] == 1:
+            return super().sample(current_state)
+        return current_state
+
+    def proposal(self, current_state: dict) -> Tuple[dict, np.ndarray, np.ndarray]:
+        """Overloaded proposal."""
+        # prop_state = deepcopy(current_state)
+        prop_state = current_state.copy()
+        prop_state[self.param] = jnp.copy(current_state[self.param])
+        # TODO (04/07/25): does this work? And do we also need to copy the coupling?
+
+        mu_cr, chol_cr = self._proposal_params(current_state)
+        prop_state[self.param] = gmrf.sample_normal(mu_cr, L=chol_cr)
+        # prop_state = self.model["y"].mean.update_prefactors(prop_state, update_index=self.parameter_index)
+        _, prop_state = self.model["y"].log_p(prop_state, update_index=self.parameter_index)
+        # TODO (17/06/25): don't need full density evaluation here, could save some computation by separately compiling
+        # the coupling matrix. Check.
+        logp_pr_g_cr = self._log_proposal_density(prop_state, mu_cr, chol_cr)
+
+        mu_pr, chol_pr = self._proposal_params(prop_state)
+        logp_cr_g_pr = self._log_proposal_density(current_state, mu_pr, chol_pr)
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+
+@dataclass
+class HamiltonianMonteCarlo(MetropolisHastings):
+    """Implementation of Hamiltonian Monte Carlo for this instance.
+    """
+    momentum_precision: np.array = 1.0
+    epsilon: float = 0.01
+    num_leapfrog_steps: int = 10
+    parameter_index: int = None
+
+    def sample(self, current_state: dict) -> dict:
+        """Overloaded version of the sample function which screens on the RJ on/off variable.
+
+        Args:
+            current_state (dict): The current state of the MCMC sampler.
+
+        Returns:
+            dict: The updated state after sampling. This is unchanged if state["qi"] == 0.
+
+        """
+        num_source = int(self.param[1:])
+        if current_state["q"][num_source] == 1:
+            return super().sample(current_state)
+        return current_state
+
+    def proposal(self, current_state: dict):
+        """Make a HMC proposal."""
+        prop_state = deepcopy(current_state)
+        initial_momentum = self._sample_initial_momentum(current_state)
+        momentum = initial_momentum.copy()
+
+        grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
+        momentum -= (self.epsilon / 2) * grad_cr
+        for k in range(self.num_leapfrog_steps):
+            prop_state[self.param] += self.epsilon * momentum
+            _, prop_state = self.model["y"].log_p(prop_state, update_index=self.parameter_index)
+            if k < self.num_leapfrog_steps - 1:
+                grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
+                momentum -= self.epsilon * grad_cr
+        momentum -= (self.epsilon / 2) * grad_cr
+
+        logp_pr_g_cr = self._evaluate_momentum_density(initial_momentum)
+        logp_cr_g_pr = self._evaluate_momentum_density(momentum)
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def _evaluate_momentum_density(self, momentum: np.ndarray) -> float:
+        """Evaluate the log-density of the momentum variable."""
+        return -0.5 * momentum.T @ (self.momentum_precision @ momentum)
+
+    def _sample_initial_momentum(self, current_state: dict) -> np.ndarray:
+        """Sample initial momentum from a Gaussian distribution."""
+        mean = np.zeros(current_state[self.param].shape)
+        return gmrf.sample_normal(mu=mean, Q=self.momentum_precision)
+
+
+@dataclass
+class SourceReversibleJump(ReversibleJump):
+    """Overloaded version of the ReversibleJump sampler, which handles the atomized source set up
+
+    TODO (17/06/25): The reversible jump acceptance now involves
+
+    """
+    indicator_var: str = "q"
+    source_variables: dict = None
+    proposal_scale: float = 1.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.source_variables = {"s" + str(i): "z" + str(i) for i in range(self.n_max)}
+        self.other_variables = list(
+            set(self.model.keys()) - set(self.source_variables.keys()) - set(self.source_variables.values())
+        )
+
+    def birth_proposal(self, current_state):
+        """Overloaded."""
+
+        prop_state = deepcopy(current_state)
+        prop_state[self.param] += 1
+        zero_loc = jnp.argwhere(prop_state[self.indicator_var].flatten() == 0)
+        birth_index = int(zero_loc[0, 0])
+        prop_state[self.indicator_var] = prop_state[self.indicator_var].at[birth_index].set(1)
+        # prop_state[self.indicator_var][birth_index] = 1
+        birth_location = "z" + str(birth_index)
+        birth_rate = "s" + str(birth_index)
+
+        # TODO (13/06/25): next section could be done with "associated parameter" or something.
+        prop_state[birth_location] = self.model[birth_location].rvs(state=prop_state, n=1)
+        # prop_state[birth_rate] = self.model[birth_rate].rvs(state=prop_state, n=1)
+        log_location_density, _ = self.model[birth_location].log_p(prop_state, by_observation=True)
+        # log_rate_density, _ = self.model[birth_rate].log_p(prop_state)
+        log_prop_density = log_location_density
+        logp_pr_g_cr, logp_cr_g_pr = 0.0, 0.0
+
+        # update coupling matrix element
+        # prop_state = self.model["y"].mean.update_prefactors(prop_state, update_index=birth_index)
+        _, prop_state = self.model["y"].log_p(prop_state, update_index=birth_index)
+        prop_state, logp_pr_g_cr, logp_cr_g_pr = self.matched_birth_transition(
+            current_state, prop_state, logp_pr_g_cr, logp_cr_g_pr, birth_index
+        )
+
+        p_birth, p_death = self.get_move_probabilities(current_state, True)
+        logp_pr_g_cr += np.log(p_birth) + log_prop_density[-1]
+        logp_cr_g_pr += np.log(p_death)
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def death_proposal(self, current_state):
+        """Overloaded."""
+
+        prop_state = deepcopy(current_state)
+        prop_state[self.param] -= 1
+        ones_loc = jnp.argwhere(prop_state[self.indicator_var].flatten() == 1)
+        death_index = int(np.random.choice(np.array(ones_loc.flatten())))
+        prop_state[self.indicator_var] = prop_state[self.indicator_var].at[death_index].set(0)
+        # prop_state[self.indicator_var][death_index] = 0
+        death_location = "z" + str(death_index)
+        death_rate = "s" + str(death_index)
+
+         # TODO (13/06/25): next section could be done with "associated parameter" or something.
+        log_location_density, _ = self.model[death_location].log_p(prop_state, by_observation=True)
+        # log_rate_density, _ = self.model[death_rate].log_p(prop_state)
+        log_prop_density = log_location_density
+        logp_pr_g_cr, logp_cr_g_pr = 0.0, 0.0
+        prop_state, logp_pr_g_cr, logp_cr_g_pr = self.matched_death_transition(
+            current_state, prop_state, logp_pr_g_cr, logp_cr_g_pr, death_index
+        )
+
+        p_birth, p_death = self.get_move_probabilities(current_state, False)
+        logp_pr_g_cr += np.log(p_death)
+        logp_cr_g_pr += np.log(p_birth) + log_prop_density[-1]
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def create_arrays(self, state: dict, index: int = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Create arrays for the coupling and emissions from the state dictionary."""
+        coupling = jnp.empty((state["A0"].shape[0], 0))
+        emissions = jnp.empty((0, 1))
+        ct = 0
+        for k in range(self.n_max):
+            if state[self.indicator_var][k] == 1:
+                coupling = jnp.concatenate((coupling, state["A" + str(k)]), axis=1)
+                emissions = jnp.concatenate((emissions, state["s" + str(k)]), axis=0)
+                if k == index:
+                    local_index = ct
+                ct += 1
+        if index is not None:
+            return coupling, emissions, local_index
+        else:
+            return coupling, emissions
+
+    def matched_birth_transition(
+        self, current_state: dict, prop_state: dict, logp_pr_g_cr: float, logp_cr_g_pr: float, birth_index: int
+    ) -> Tuple[dict, float, float]:
+        """Overloaded birth transition function for the emissions that works with JAX arrays."""
+        coupling_current, emissions_current = self.create_arrays(current_state)
+        coupling_proposed, emissions_proposed, birth_local_index = self.create_arrays(prop_state, birth_index)
+
+        G = jnp.linalg.solve(
+            coupling_proposed.T @ coupling_proposed + (1e-8) * jnp.eye(coupling_proposed.shape[1]),
+            coupling_proposed.T @ coupling_current
+        )
+        F = jnp.insert(G, obj=birth_local_index, values=jnp.eye(N=G.shape[0], M=1, k=-birth_local_index).flatten(), axis=1)
+        mu_star = G @ emissions_current
+        emissions_prop = mu_star.copy()
+        emissions_prop = emissions_prop.at[birth_local_index].set(
+            gmrf.truncated_normal_rv(
+                mean=emissions_prop.at[birth_local_index].get(), scale=self.proposal_scale, lower=0.0, upper=1e6, size=1
+            )
+        )
+        ct = 0
+        for k in range(self.n_max):
+            if prop_state[self.indicator_var].at[k].get() == 1:
+                prop_state["s" + str(k)] = mu_star[[ct], :]
+                ct += 1
+        # logp_pr_g_cr += gmrf.truncated_normal_log_pdf(
+        #     emissions_prop.at[birth_local_index].get(), mu_star.at[birth_local_index].get(), self.proposal_scale, lower=0.0, upper=1e6
+        # )
+        logp_pr_g_cr += stats.norm.logpdf(
+            emissions_prop.at[birth_local_index].get(), mu_star.at[birth_local_index].get(), self.proposal_scale
+        )
+        logp_cr_g_pr += jnp.log(jnp.linalg.det(F))
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def matched_death_transition(
+            self, current_state: dict, prop_state: dict, logp_pr_g_cr: float, logp_cr_g_pr: float, death_index: int
+    ) -> Tuple[dict, float, float]:
+        """Overloaded death transition function for the emissions that works with JAX arrays."""
+        proposal_scale = 0.1
+
+        coupling_current, emissions_current, death_local_index = self.create_arrays(current_state, death_index)
+        coupling_proposed, emissions_proposed = self.create_arrays(prop_state)
+
+        G = jnp.linalg.solve(
+            coupling_current.T @ coupling_current + (1e-8) * jnp.eye(coupling_current.shape[1]),
+            coupling_current.T @ coupling_proposed
+        )
+        F = jnp.insert(G, obj=death_local_index, values=jnp.eye(N=G.shape[0], M=1, k=-death_local_index).flatten(), axis=1)
+        mu_aug = jnp.linalg.solve(F, emissions_current)
+        param_del = mu_aug.at[death_local_index].get()
+        param_rem = jnp.delete(mu_aug, obj=death_local_index, axis=0)
+        ct = 0
+        for k in range(self.n_max):
+            if prop_state[self.indicator_var].at[k].get() == 1:
+                prop_state["s" + str(k)] = param_rem[[ct], :]
+                ct += 1
+
+        logp_pr_g_cr += jnp.log(jnp.linalg.det(F))
+        # logp_cr_g_pr += gmrf.truncated_normal_log_pdf(
+        #     param_del, 0.0, self.proposal_scale, lower=0.0, upper=1e6
+        # )
+        logp_cr_g_pr += stats.norm.logpdf(
+            param_del, 0.0, self.proposal_scale
+        )
+
+        return prop_state, logp_pr_g_cr, logp_cr_g_pr
+
+    def _accept_reject_proposal(self, current_state, prop_state, logp_pr_g_cr, logp_cr_g_pr):
+        """Overloaded."""
+        self.accept_rate.increment_proposal()
+        logp_cs = 0
+        logp_pr = 0
+        ct = 0
+        for rate, loc in self.source_variables.items():
+            if current_state[self.indicator_var].at[ct].get() == 1:
+                logp_cr_rate, _ = self.model[rate].log_p(current_state)
+                logp_cr_loc, _ = self.model[loc].log_p(current_state)
+                logp_cs += (logp_cr_rate + logp_cr_loc)
+            if prop_state[self.indicator_var].at[ct].get() == 1:
+                logp_pr_rate, _ = self.model[rate].log_p(prop_state)
+                logp_pr_loc, _ = self.model[loc].log_p(prop_state)
+                logp_pr += (logp_pr_rate + logp_pr_loc)
+            ct += 1
+        logp_cs_y, _ = self.model["y"].log_p(current_state)
+        logp_pr_y, _ = self.model["y"].log_p(prop_state)
+        logp_cs_rho, _ = self.model["n_src"].log_p(current_state)
+        logp_pr_rho, _ = self.model["n_src"].log_p(prop_state)
+        likelihood_diff = logp_pr_y - logp_cs_y
+        logp_pr += logp_pr_rho
+        logp_cs += logp_cs_rho
+        # for var in self.other_variables:
+        #     logp_cr_dist, _ = self.model[var].log_p(current_state)
+        #     logp_cs += logp_cr_dist
+        #     logp_pr_dist, _ = self.model[var].log_p(prop_state)
+        #     logp_pr += logp_pr_dist
+        log_accept = likelihood_diff + logp_pr + logp_cr_g_pr - (logp_cs + logp_pr_g_cr)
+
+        if self.accept_proposal(log_accept):
+            current_state = prop_state
+            self.accept_rate.increment_accept()
+        return current_state
+
+
+@dataclass
+class NullSampler(MCMCSampler):
+    """Implementing null sampler, to enable stoarge of something that is not directly sampled."""
+
+    def sample(self, current_state: dict) -> dict:
+        """Overloaded sample function which does nothing."""
+        return current_state
