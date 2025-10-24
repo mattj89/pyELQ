@@ -90,43 +90,20 @@ else:
     )
 
 # populate sources
-for i in range(model.components["source"].n_sources_max):
-    if i < num_real_sources:
-        state["z" + str(i)] = jnp.array(
-            np.array([[start_locations[0, i]], [start_locations[1, i]], [start_locations[2, i]]])
-        )
-    else:
-        state["z" + str(i)] = jnp.array(
-            np.random.uniform(low=np.array([[0], [0], [0]]), high=np.array([[30], [30], [5]]), size=(3, 1))
-        )
-
-# populate emission rates
-for i in range(model.components["source"].n_sources_max):
-    if i < num_real_sources:
-        state["s" + str(i)] = jnp.array([[real_emission_rates[i, 0]]])
-    else:
-        state["s" + str(i)] = jnp.zeros(shape=(1, 1))
-
-# populate source on/off indicator
-state["q"] = jnp.zeros(shape=(model.components["source"].n_sources_max, 1))
-for i in range(model.components["source"].n_sources_max):
-    if i < 5:
-        state["q"] = state["q"].at[i].set(1)
-    else:
-        state["q"] = state["q"].at[i].set(0)
-state["n_src"] = int(jnp.sum(state["q"]))
+state["z_src"] = jnp.array(start_locations)
+state["n_src"] = state["z_src"].shape[1]
+state["s"] = jnp.array(real_emission_rates)
 
 # convert the generated data to jnp
 msr_std = 5.0
 state["y"] = jnp.array(original_state["y"] + np.random.normal(size=original_state["y"].shape) * msr_std)
 
-# populate coupling matrix
-n_data = state["y"].shape[0]
-for i in range(model.components["source"].n_sources_max):
-    state["A" + str(i)] = jnp.zeros(shape=(n_data, 1))
+# populate initial coupling matrix
+state["A"] = jnp.zeros(shape=(state["y"].shape[0], state["n_src"]))
 
 # create predictor object
-form_dict = {"s" + str(i): "A" + str(i) for i in range(model.components["source"].n_sources_max)}
+# form_dict = {"s" + str(i): "A" + str(i) for i in range(model.components["source"].n_sources_max)}
+form_dict = {"s": "A"}
 source_parameter = SourceModelParameter(
     form=form_dict,
     sensor_object=model.sensor_object,
@@ -138,8 +115,7 @@ source_parameter = SourceModelParameter(
 
 # get the coupling columns corresponding to current locations
 test_array, _ = source_parameter.predictor(state)
-for i in range(model.components["source"].n_sources_max):
-    state = source_parameter.update_prefactors(state, update_index=i)
+state = source_parameter.update_prefactors(state)
 
 # other params in state
 state["Q"] = (1 / msr_std**2) * jnp.eye(state["y"].size) # measurement error precision matrix
@@ -151,49 +127,46 @@ jit_comp_flag = True
 # create the data likelihood
 likelihood_y = Normal_jax(
     response="y",
-    grad_list=["z" + str(i) for i in range(model.components["source"].n_sources_max)] + \
-        ["s" + str(i) for i in range(model.components["source"].n_sources_max)],
+    grad_list=["z_src", "s"],
     mean=source_parameter,
     precision=Identity("Q"),
     scalar_precision=1.0 / msr_std**2,
     jit_compile=jit_comp_flag
 )
-likelihood_y.param_list = ["s" + str(i) for i in range(model.components["source"].n_sources_max)] + \
-    ["z" + str(i) for i in range(model.components["source"].n_sources_max)]
+likelihood_y.param_list = ["s", "z_src"]
 
 # test the data likelihood
 log_p, state = likelihood_y.log_p(state)
 
 """Set up the rest of the MCMC sampler components."""
 
+# priors for the sources
+state["mu_s"] = jnp.array([0.0])
+state["P_s"] = jnp.array([[1.0 / jnp.power(5.0, 2)]])
+
+# model list stuff
 model_list = [likelihood_y]
-for i in range(model.components["source"].n_sources_max):
-    # prior state stuff
-    state["mu_s" + str(i)] = jnp.array([0.0])
-    state["P_s" + str(i)] = jnp.array([[1.0 / jnp.power(5.0, 2)]])
-    # emission rate prior
-    model_list.append(
-        Normal_jax(
-            response="s" + str(i),
-            grad_list=["s" + str(i)],
-            mean=Identity("mu_s" + str(i)),
-            precision=Identity("P_s" + str(i)),
-            scalar_precision=1 / 50.0**2,
-            domain_response_lower=0.0,
-            jit_compile=jit_comp_flag
-        )
+model_list.append(
+    Normal_jax(
+        response="s",
+        grad_list=["s"],
+        mean=Identity("mu_s"),
+        precision=Identity("P_s"),
+        scalar_precision=1 / 50.0**2,
+        domain_response_lower=0.0,
+        jit_compile=jit_comp_flag
     )
-    model_list[-1].param_list = ["s" + str(i)]
-    # location prior
-    model_list.append(
-        Uniform_jax(
-            response="z" + str(i),
-            grad_list=["z" + str(i)],
-            domain_response_lower=np.array([[0], [0], [0]]),
-            domain_response_upper=np.array([[30], [30], [5]]),
-        )
+)
+model_list[-1].param_list = ["s"]
+model_list.append(
+    Uniform_jax(
+        response="z_src",
+        grad_list=["z_src"],
+        domain_response_lower=np.array([[0], [0], [0]]),
+        domain_response_upper=np.array([[30], [30], [5]]),
     )
-    model_list[-1].param_list = ["z" + str(i)]
+)
+model_list[-1].param_list = ["z_src"]
 # Poisson prior for the number of sources
 model_list.append(Poisson(response="n_src", rate="rho"))
 # create the overall model
@@ -201,17 +174,17 @@ mdl = Model(model_list)
 mdl.response = {"y": "mean"}
 
 sampler_list = []
-hmc_precision = jnp.eye(3) * (0.01)
-for i in range(model.components["source"].n_sources_max):
-    # sampler_list.append(ScreenedManifoldMALA("z" + str(i), mdl, step=0.5, parameter_index=i))
-    sampler_list.append(NormalNormal("s" + str(i), mdl))
-    sampler_list.append(HamiltonianMonteCarlo("z" + str(i), mdl, step=0.01, momentum_precision=hmc_precision, epsilon=5e-4, num_leapfrog_steps=20, parameter_index=i))
+hmc_precision = 0.01
+sampler_list.append(NormalNormal("s", mdl, max_variable_size=model.components["source"].n_sources_max))
+sampler_list.append(HamiltonianMonteCarlo(
+    "z_src", mdl, max_variable_size=(3, model.components["source"].n_sources_max), step=0.01,
+    momentum_precision=hmc_precision, epsilon=1e-4, num_leapfrog_steps=10
+))
 sampler_list.append(SourceReversibleJump(
     "n_src", mdl, step=np.array([1.0], ndmin=2),
     n_max=model.components["source"].n_sources_max,
-    associated_params=["q"]
+    associated_params=["z_src"]
 ))
-sampler_list.append(NullSampler("q", mdl))
 
 initial_state = deepcopy(state)
 mcmc = MCMC(initial_state, sampler_list, model=mdl, n_burn=1000, n_iter=500)
@@ -223,6 +196,8 @@ mcmc.run_mcmc()
 """
 Make some plots of the results (both cases).
 """
+
+# choose a number of burn-in
 
 # plot the fit to the data
 fig = go.Figure()
@@ -258,14 +233,11 @@ fig.show()
 fig = go.Figure()
 fig = model.sensor_object.plot_sensor_location(fig)
 for i in range(model.components["source"].n_sources_max):
-    location_name = "z" + str(i)
-    emission_name = "s" + str(i)
-    on_index = mcmc.store["q"][i, :] == 1
-    location_series = mcmc.store[location_name][:, on_index]
+    location_series = mcmc.store["z_src"][:, i, :]
     enu_object = ENU(east=location_series[0, :], north=location_series[1, :], up=location_series[2, :],
                      ref_latitude=0.0, ref_longitude=0.0, ref_altitude=0.0)
     lla_object = enu_object.to_lla()
-    emission_series = mcmc.store[emission_name][:, on_index]
+    emission_series = mcmc.store["s"][i, :]
     fig.add_trace(
             go.Scattermap(
                 mode="markers",
@@ -273,7 +245,7 @@ for i in range(model.components["source"].n_sources_max):
                 lon=np.array(lla_object.longitude),
                 marker=dict(
                     size=10,
-                    color=emission_series[0, :],
+                    color=emission_series,
                     coloraxis="coloraxis",
                 ),
                 showlegend=False
