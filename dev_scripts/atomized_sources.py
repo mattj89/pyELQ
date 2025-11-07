@@ -95,7 +95,7 @@ state["n_src"] = state["z_src"].shape[1]
 state["s"] = jnp.array(real_emission_rates)
 
 # convert the generated data to jnp
-msr_std = 5.0
+msr_std = 10.0
 state["y"] = jnp.array(original_state["y"] + np.random.normal(size=original_state["y"].shape) * msr_std)
 
 # populate initial coupling matrix
@@ -119,7 +119,7 @@ state = source_parameter.update_prefactors(state)
 
 # other params in state
 state["Q"] = (1 / msr_std**2) * jnp.eye(state["y"].size) # measurement error precision matrix
-state["rho"] = np.array([1.0])  # Poisson rate for the number of sources
+state["rho"] = np.array([2.0])  # Poisson rate for the number of sources
 
 # flag for jit compilation
 jit_comp_flag = True
@@ -142,7 +142,7 @@ log_p, state = likelihood_y.log_p(state)
 
 # priors for the sources
 state["mu_s"] = jnp.array([0.0])
-state["P_s"] = jnp.array([[1.0 / jnp.power(5.0, 2)]])
+state["P_s"] = jnp.array([[1.0 / jnp.power(10.0, 2)]])
 
 # model list stuff
 model_list = [likelihood_y]
@@ -178,7 +178,7 @@ hmc_precision = 0.01
 sampler_list.append(NormalNormal("s", mdl, max_variable_size=model.components["source"].n_sources_max))
 sampler_list.append(HamiltonianMonteCarlo(
     "z_src", mdl, max_variable_size=(3, model.components["source"].n_sources_max), step=0.01,
-    momentum_precision=hmc_precision, epsilon=1e-4, num_leapfrog_steps=10
+    momentum_precision=hmc_precision, epsilon=2.5e-4, num_leapfrog_steps=10
 ))
 sampler_list.append(SourceReversibleJump(
     "n_src", mdl, step=np.array([1.0], ndmin=2),
@@ -343,4 +343,31 @@ for i in range(real_locations.shape[1]):
         )
     )
 fig.update_layout(coloraxis = {'colorscale':'jet'})
+fig.show()
+
+"""
+Diagnostic plots
+"""
+
+# what happens with the num. sources in the solution in both cases?
+
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(
+        x=np.arange(model.mcmc.n_iter),
+        y=model.mcmc.store["n_src"][0, :],
+        mode="lines",
+        name="Original MCMC",
+        line=dict(color="blue")
+    )
+)
+fig.add_trace(
+    go.Scatter(
+        x=np.arange(mcmc.n_iter),
+        y=mcmc.store["n_src"][0, :],
+        mode="lines",
+        name="JAX MCMC",
+        line=dict(color="red")
+    )
+)
 fig.show()
