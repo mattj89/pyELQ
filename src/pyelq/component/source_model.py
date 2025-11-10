@@ -890,18 +890,31 @@ class SourceModelParameter(LinearCombination_jax):
     Initialization of the parameter class extracts the sensor locations and meteorology information from the objects
     passed in, converts them to jax.numpy arrays and stores them locally on the class.
 
+    The function self.update_prefactors() can be used to re-calculate (columns of) the coupling matrix as the
+    information in the state object changes.
+
     Attributes:
-        sensor_locations (dict):
+        sensor_locations_x (dict): dictionary of jax.numpy arrays containing the x-locations of the sensors. Dict keys
+            correspond to sensor names.
+        sensor_locations_y (dict): dictionary of jax.numpy arrays containing the y-locations of the sensors.
+        sensor_locations_z (dict): dictionary of jax.numpy arrays containing the z-locations of the sensors.
+        wind_speed (dict): dictionary of jax.numpy arrays containing the wind speed time series.
+        theta (dict): dictionary of jax.numpy arrays containing the wind direction time series.
+        wind_turbulence_horizontal (dict): dictionary of jax.numpy arrays containing the horizontal wind
+            turbulence time series.
+        wind_turbulence_vertical (dict): dictionary of jax.numpy arrays containing the vertical wind turbulence
+            time series.
+        gas_density (jnp.ndarray): jax.numpy array containing the gas density.
+        n_sources_max (int): maximum number of sources allowed in the model.
 
     """
     sensor_locations_x: dict
     sensor_locations_y: dict
     sensor_locations_z: dict
-    form: dict
-    wind_speed: jnp.ndarray
-    theta: jnp.ndarray
-    wind_turbulence_horizontal: jnp.ndarray
-    wind_turbulence_vertical: jnp.ndarray
+    wind_speed: dict
+    theta: dict
+    wind_turbulence_horizontal: dict
+    wind_turbulence_vertical: dict
     gas_density: jnp.ndarray
     n_sources_max: int
 
@@ -909,7 +922,12 @@ class SourceModelParameter(LinearCombination_jax):
         """Function which takes the pyELQ data sensor and meteorology objects, converts the relevant attributes to
         jax.numpy objects, and attaches them to the class ready for repeated use in the sampler.
 
-
+        Args:
+            sensor_object (SensorGroup): object containing sensor data.
+            meteorology_object (MeteorologyGroup): object containing meteorology data.
+            gas_species (GasSpecies): object containing gas species information.
+            source_map (SourceMap): object containing source location information.
+            n_sources_max (int): maximum number of sources allowed in the model.
 
         """
         self.form = form
@@ -918,28 +936,18 @@ class SourceModelParameter(LinearCombination_jax):
         self.gas_density = jnp.array(gas_species.gas_density())
         self.n_sources_max = n_sources_max
 
-    def predictor_conditional(self, state, term_to_exclude = None):
-        """Overloaded version, to take account of the fact that the terms are being screened in/out by the RJ
-        indicator.
-
-        TODO (21/10/21): do we even need to overload this now?
-        """
-        if term_to_exclude is None:
-            term_to_exclude = []
-
-        if isinstance(term_to_exclude, str):
-            term_to_exclude = [term_to_exclude]
-
-        sum_terms = 0
-        for prm, prefactor in self.form.items():
-            if prm not in term_to_exclude:
-                sum_terms += state[prefactor] @ state[prm]
-        return sum_terms
-
     def extract_sensor_information(self, sensor_object, source_map):
-        """Sub-function for extracting and storing sensor location information."""
-        source_map_enu = source_map.location
-        # TODO (14/06/24): May need to handle the co-ordinate conversion- assuming ENU for now.
+        """Sub-function for extracting and storing sensor location information.
+
+        Extracts the sensor information and converts to jax.numpy arrays for for repeated calculation of the coupling
+        matrix during the inversion algorithm.
+
+        Args:
+            sensor_object (SensorGroup): object containing sensor data.
+            source_map (SourceMap): object containing source location information.
+
+        """
+        source_map_enu = source_map.location.to_enu()
         self.sensor_locations_x = {}
         self.sensor_locations_y = {}
         self.sensor_locations_z = {}
@@ -964,7 +972,15 @@ class SourceModelParameter(LinearCombination_jax):
             self.sensor_locations_z[key] = jax_locations[:, [2], :]
 
     def extract_meteorology_information(self, meteorology_object):
-        """Sub-function for extracting and storing meteorological information."""
+        """Sub-function for extracting and storing meteorological information.
+
+        Extracts the meteorology information and converts to jax.numpy arrays for for repeated calculation of the
+        coupling matrix during the inversion algorithm.
+
+        Args:
+            meteorology_object (MeteorologyGroup): object containing meteorology data.
+
+        """
         self.wind_speed = {}
         self.theta = {}
         self.wind_turbulence_horizontal = {}
@@ -978,7 +994,7 @@ class SourceModelParameter(LinearCombination_jax):
             self.wind_turbulence_vertical[key] = \
                 jnp.array(meteo.wind_turbulence_vertical).reshape((meteo.wind_turbulence_vertical.shape[0], 1, 1))
 
-    def update_prefactors(self, state: dict, update_index: list = None) -> dict:
+    def update_prefactors(self, state: dict, update_index: Union[list, None] = None) -> dict:
         """Update the coupling matrix based on the information in the state.
 
         Accounts for the situation where e.g. the source location or the wind sigma parameters change during the MCMC.
@@ -986,11 +1002,10 @@ class SourceModelParameter(LinearCombination_jax):
         TODO (14/06/24): There might be a better way to implement this (instead of a loop): but need to account for the
         fact that the point and beam sensor cases get handled differently (need a 3rd dimension for the beam knots).
 
-        TODO (14/06/24): For the reversible jump case, might need to add an update of the number of sources and
-        allocation vector.
-
         Args:
             state (dict): dictionary containing current state information.
+            update_index (Union[list, None]): list of indices of the sources for which the coupling should be updated.
+                If None, all sources are updated. Defaults to None.
 
         """
         if update_index is None:
@@ -1024,6 +1039,9 @@ class SourceModelParameter(LinearCombination_jax):
 @dataclass
 class ScreenedManifoldMALA(ManifoldMALA):
     """Version of ManifoldMALA sampler which screens on the RJ on/off variable.
+
+    TODO (10/11/25): since we are now using the HMC for everything, don't know whether this is still necessary.
+    Document properly or remove.
 
     If state["qi"] == 1 for i = 1,2,...,n, then a sample is generated for source i using the usual functionality.
     If state["qi"] == 0, then the source i is not sampled, and the coupling matrix is not updated for that source.
@@ -1069,14 +1087,38 @@ class ScreenedManifoldMALA(ManifoldMALA):
 @dataclass
 class HamiltonianMonteCarlo(MetropolisHastings):
     """Implementation of Hamiltonian Monte Carlo for this instance.
+
+    Attributes:
+        momentum_precision (float): scalar precision parameter for the HMC precision. TODO (10/11/25): should we
+            reintroduce the version with a full array specified?
+        epsilon (float): leapfrog step size. TODO (10/11/25): should we just use stepsize here?
+        num_leapfrog_steps (int): number of leapfrog steps to take per proposal.
+        parameter_index (Union[int, None]): index of the parameter to be updated in the coupling matrix. If None, the
+            whole parameter set is updated.
+
     """
     momentum_precision: np.array = 1.0
     epsilon: float = 0.01
     num_leapfrog_steps: int = 10
-    parameter_index: int = None
+    parameter_index: Union[int, None] = None
 
     def proposal(self, current_state: dict):
-        """Make a HMC proposal."""
+        """Make a HMC proposal.
+
+        The standard leapfrog integrator is applied to generate a proposal for self.param, using step size self.epsilon
+        and self.num_leapfrog_steps leapfrog steps.
+
+        Args:
+            current_state (dict): dict with current state information.
+
+        Returns:
+            prop_state (dict): proposed state after running leapfrog algorithm.
+            logp_pr_g_cr (float): log-transition density of the proposed state given the current state
+                (i.e. log[p(proposed | current)]).
+            logp_cr_g_pr (float): log-transition density of the current state given the proposed state
+                (i.e. log[p(current | proposed)]).
+
+        """
         prop_state = deepcopy(current_state)
         initial_momentum = self._sample_initial_momentum(current_state)
         momentum = initial_momentum.copy()
@@ -1097,11 +1139,26 @@ class HamiltonianMonteCarlo(MetropolisHastings):
         return prop_state, logp_pr_g_cr, logp_cr_g_pr
 
     def _evaluate_momentum_density(self, momentum: np.ndarray) -> float:
-        """Evaluate the log-density of the momentum variable."""
+        """Evaluate the log-density of the momentum variable.
+
+        Args:
+            momentum (np.ndarray): momentum variable.
+
+        Returns:
+            float: log-density of the momentum variable.
+        """
         return -0.5 * (momentum.T @ momentum) * self.momentum_precision
 
     def _sample_initial_momentum(self, current_state: dict) -> np.ndarray:
-        """Sample initial momentum from a Gaussian distribution."""
+        """Sample initial momentum from a Gaussian distribution.
+
+        Args:
+            current_state (dict): dict with current state information.
+
+        Returns:
+            np.ndarray: initial momentum sample.
+
+        """
         mean = np.zeros(shape=(current_state[self.param].size, 1))
         return gmrf.sample_normal(mu=mean, Q=self.momentum_precision * jnp.eye(mean.shape[0]))
 
@@ -1113,7 +1170,6 @@ class SourceReversibleJump(ReversibleJump):
     TODO (17/06/25): The reversible jump acceptance now involves
 
     """
-    indicator_var: str = "q"
     source_variables: dict = None
     proposal_scale: float = 1.0
 
@@ -1125,8 +1181,22 @@ class SourceReversibleJump(ReversibleJump):
         )
 
     def birth_proposal(self, current_state):
-        """Overloaded."""
+        """Overloaded birth proposal function for the reversible jump in the JAX sampler case.
 
+        TODO (10/11/25): the only reason this gets overloaded is because we need jnp.concatenate instead of
+        np.concatenate. Is there a way to accommodate this within the original function?
+
+        Args:
+            current_state (dict): dictionary containing current state information.
+
+        Returns:
+            prop_state (dict): proposed state after birth move.
+            logp_pr_g_cr (float): log-transition density of the proposed state given the current state
+                (i.e. log[p(proposed | current)]).
+            logp_cr_g_pr (float): log-transition density of the current state given the proposed state
+                (i.e. log[p(current | proposed)]).
+
+        """
         prop_state = deepcopy(current_state)
         prop_state[self.param] += 1
         log_prop_density = 0.0
@@ -1138,7 +1208,6 @@ class SourceReversibleJump(ReversibleJump):
             log_prop_density += log_associated_density
         logp_pr_g_cr, logp_cr_g_pr = 0.0, 0.0
 
-        # update coupling matrix element
         prop_state["s"] = jnp.concatenate((prop_state["s"], jnp.array([0.0], ndmin=2)), axis=0)
         _, prop_state = self.model["y"].log_p(prop_state, update_index=None)
         prop_state, logp_pr_g_cr, logp_cr_g_pr = self.matched_birth_transition(
@@ -1151,8 +1220,22 @@ class SourceReversibleJump(ReversibleJump):
         return prop_state, logp_pr_g_cr, logp_cr_g_pr
 
     def death_proposal(self, current_state):
-        """Overloaded."""
+        """Overloaded death proposal function for the reversible jump in the JAX sampler case.
 
+        TODO (10/11/25): the only reason this needs overloading is because we need jnp.delete instead of np.delete. Is
+        there a way to accommodate this within the original function?
+
+        Args:
+            current_state (dict): dictionary containing current state information.
+
+        Returns:
+            prop_state (dict): proposed state after death move.
+            logp_pr_g_cr (float): log-transition density of the proposed state given the current state
+                (i.e. log[p(proposed | current)]).
+            logp_cr_g_pr (float): log-transition density of the current state given the proposed state
+                (i.e. log[p(current | proposed)]).
+
+        """
         prop_state = deepcopy(current_state)
         prop_state[self.param] -= 1
         log_prop_density = 0.0
@@ -1178,7 +1261,23 @@ class SourceReversibleJump(ReversibleJump):
     def matched_birth_transition(
         self, current_state: dict, prop_state: dict, logp_pr_g_cr: float, logp_cr_g_pr: float
     ) -> Tuple[dict, float, float]:
-        """Overloaded birth transition function for the emissions that works with JAX arrays."""
+        """Overloaded birth transition function for the emissions that works with JAX arrays.
+
+        This function copies the functionality of ReversibleJump.matched_birth_transition(), but uses jax.numpy
+        functions instead of numpy ones.
+
+        Args:
+            current_state (dict): dictionary containing parameters of the current state.
+            prop_state (dict): dictionary containing the parameters of the proposed state.
+            logp_pr_g_cr (float): log-transition density of the proposed state given the current state
+                (i.e. log[p(proposed | current)]).
+            logp_cr_g_pr (float): log-transition density of the current state given the proposed state
+                (i.e. log[p(current | proposed)]).
+
+        Returns:
+            prop_state (dict): proposed state, with emissions updated.
+
+        """
         coupling_current = current_state["A"]
         coupling_proposed = prop_state["A"]
         emissions_current = current_state["s"]
@@ -1200,17 +1299,30 @@ class SourceReversibleJump(ReversibleJump):
         logp_pr_g_cr += gmrf.truncated_normal_log_pdf(
             emissions_proposed.at[birth_index].get(), mu_star.at[birth_index].get(), self.proposal_scale, lower=0.0, upper=1e6
         )
-        # logp_pr_g_cr += stats.norm.logpdf(
-        #     emissions_proposed.at[birth_index].get(), mu_star.at[birth_index].get(), self.proposal_scale
-        # )
         logp_cr_g_pr += jnp.log(jnp.linalg.det(F))
-
         return prop_state, logp_pr_g_cr, logp_cr_g_pr
 
     def matched_death_transition(
             self, current_state: dict, prop_state: dict, logp_pr_g_cr: float, logp_cr_g_pr: float, deletion_index: int
     ) -> Tuple[dict, float, float]:
-        """Overloaded death transition function for the emissions that works with JAX arrays."""
+        """Overloaded death transition function for the emissions that works with JAX arrays.
+
+        This function copies the functionality of ReversibleJump.matched_death_transition(), but uses jax.numpy
+        functions instead of numpy ones.
+
+        Args:
+            current_state (dict): dictionary containing parameters of the current state.
+            prop_state (dict): dictionary containing the parameters of the proposed state.
+            logp_pr_g_cr (float): log-transition density of the proposed state given the current state
+                (i.e. log[p(proposed | current)]).
+            logp_cr_g_pr (float): log-transition density of the current state given the proposed state
+                (i.e. log[p(current | proposed)]).
+            deletion_index (int): index of the source to be deleted in the overall set of sources.
+
+        Returns:
+            prop_state (dict): proposed state, with emissions updated.
+
+        """
         coupling_current = current_state["A"]
         coupling_proposed = prop_state["A"]
         emissions_current = current_state["s"]
@@ -1224,15 +1336,10 @@ class SourceReversibleJump(ReversibleJump):
         param_del = mu_aug.at[deletion_index].get()
         param_rem = jnp.delete(mu_aug, obj=deletion_index, axis=0)
         prop_state["s"] = param_rem
-
         logp_pr_g_cr += jnp.log(jnp.linalg.det(F))
         logp_cr_g_pr += gmrf.truncated_normal_log_pdf(
             param_del, 0.0, self.proposal_scale, lower=0.0, upper=1e6
         )
-        # logp_cr_g_pr += stats.norm.logpdf(
-        #     param_del, 0.0, self.proposal_scale
-        # )
-
         return prop_state, logp_pr_g_cr, logp_cr_g_pr
 
 

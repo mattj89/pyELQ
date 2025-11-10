@@ -178,7 +178,7 @@ hmc_precision = 0.01
 sampler_list.append(NormalNormal("s", mdl, max_variable_size=model.components["source"].n_sources_max))
 sampler_list.append(HamiltonianMonteCarlo(
     "z_src", mdl, max_variable_size=(3, model.components["source"].n_sources_max), step=0.01,
-    momentum_precision=hmc_precision, epsilon=2.5e-4, num_leapfrog_steps=10
+    momentum_precision=hmc_precision, epsilon=2e-4, num_leapfrog_steps=20
 ))
 sampler_list.append(SourceReversibleJump(
     "n_src", mdl, step=np.array([1.0], ndmin=2),
