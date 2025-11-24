@@ -1,0 +1,11 @@
+{
+    "reference_coordinate":{"latitude": 52.70915632, "longitude": 6.43353518, "altitude": 8.73},
+    "site_limits": {"x_min": -180.0, "x_max": 2.0, "y_min": -160.0, "y_max": 60.0, "z_min": 0.0, "z_max": 15.0},
+    "source_model": {"emission_rate_mean": 0.0, "initial_standard_deviation": 50.0, "reversible_jump": true,
+    "rate_num_sources": 4.0, "update_precision": false, "coverage_detection": 0.1, "coverage_test_source": 3.0},
+    "background": {"n_time": null, "mean_bg": 2.25, "spatial_dependence": true, "spatial_correlation_param": 25.0,
+    "update_precision": false, "initial_standard_deviation": 0.001, "standard_deviation_time_0": 1000.0},
+    "offset_model": {"update_precision": false, "initial_standard_deviation": 0.01},
+    "error_model": {"initial_standard_deviation": 0.1, "prior_precision_shape": 0.01, "prior_precision_rate": 0.01},
+    "general_settings": {"smoothing_period": 10, "min_wind_speed": 0.7, "n_iter": 100, "n_thin": 1, "multiple_sourcemaps": false}
+}

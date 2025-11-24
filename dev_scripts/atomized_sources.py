@@ -118,7 +118,6 @@ test_array, _ = source_parameter.predictor(state)
 state = source_parameter.update_prefactors(state)
 
 # other params in state
-state["Q"] = (1 / msr_std**2) * jnp.eye(state["y"].size) # measurement error precision matrix
 state["rho"] = np.array([2.0])  # Poisson rate for the number of sources
 
 # flag for jit compilation

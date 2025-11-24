@@ -1124,13 +1124,15 @@ class HamiltonianMonteCarlo(MetropolisHastings):
         momentum = initial_momentum.copy()
 
         grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
+        # grad_cr = jnp.zeros_like(momentum)
         momentum += (self.epsilon / 2) * grad_cr
         log_p_rolling = np.empty(shape=(self.num_leapfrog_steps,))
         for k in range(self.num_leapfrog_steps):
             prop_state[self.param] += jnp.reshape(self.epsilon * momentum, shape=prop_state[self.param].shape)
             log_p_rolling[k], prop_state = self.model["y"].log_p(prop_state, update_index=self.parameter_index)
+            grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
+            # grad_cr = jnp.zeros_like(momentum)
             if k < self.num_leapfrog_steps - 1:
-                grad_cr = self.model.grad_log_p(prop_state, param=self.param, hessian_required=False)
                 momentum += self.epsilon * grad_cr
         momentum += (self.epsilon / 2) * grad_cr
 
